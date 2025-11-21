@@ -132,6 +132,50 @@ class OrderManager:
         else:
             logger.info(f"[{symbol}] Filling-Versuche: {summary}")
 
+    def _log_skipped(self, symbol: str, reason: str, required: Optional[float], actual: Optional[float]) -> None:
+        parts = [reason]
+        if actual is not None and required is not None:
+            parts.append(f"Abstand {actual:.6f} < {required:.6f}")
+        logger.info(f"[{symbol}] Order übersprungen: {' | '.join(parts)}")
+
+    def _notify_webhook(
+        self,
+        symbol: str,
+        signal: EntrySignal,
+        result: dict,
+        volume: float,
+        risk_amount: float,
+        risk_per_lot: float,
+        stop_distance: float,
+    ) -> None:
+        url = self.cfg.webhook_url
+        if not url:
+            return
+        if result.get("retcode") != self.SUCCESS_RETCODE:
+            return
+        timestamp = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+        embed = {
+            "title": f"Live Trade ausgeführt: {symbol} {signal.direction.value}",
+            "color": 0x1abc9c,
+            "fields": [
+                {"name": "Setup", "value": signal.setup, "inline": True},
+                {"name": "Volume", "value": f"{volume:.3f} Lots", "inline": True},
+                {"name": "Entry", "value": f"{signal.entry_price:.4f}", "inline": True},
+                {"name": "Stop", "value": f"{signal.stop_loss:.4f}", "inline": True},
+                {"name": "TP", "value": f"{signal.take_profit:.4f}", "inline": True},
+                {"name": "Risk", "value": f"{risk_amount:.2f} | per lot {risk_per_lot:.3f}", "inline": True},
+                {"name": "Retcode", "value": result.get("retcode_description", str(result.get("retcode"))), "inline": True},
+            ],
+            "timestamp": timestamp,
+        }
+        payload = {"username": "EW Live Executor", "embeds": [embed]}
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(request, timeout=5)
+        except Exception as exc:
+            logger.warning(f"[{symbol}] Webhook-Benachrichtigung fehlgeschlagen: {exc}")
+
     def _process_execution_result(self, symbol: str, direction: Dir, result: dict) -> None:
         retcode = result.get("retcode")
         if retcode != self.SUCCESS_RETCODE:
