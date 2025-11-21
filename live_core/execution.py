@@ -6,7 +6,7 @@ import logging
 import math
 import urllib.request
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from statistics import pstdev, StatisticsError
 from typing import Any, Dict, Deque, List, Optional, Tuple
 
@@ -28,7 +28,6 @@ class OrderManager:
     def __init__(self, mt5_adapter: MetaTrader5Adapter, cfg: LiveConfig):
         self.adapter = mt5_adapter
         self.cfg = cfg
-        self._cooldowns: Dict[str, datetime] = {}
         self._long_only_symbols: set[str] = set()
         self._short_only_symbols: set[str] = set()
         self._highest_balance: float = cfg.account_balance
@@ -40,10 +39,6 @@ class OrderManager:
             return
         if not self.adapter.connected:
             raise RuntimeError("MT5 nicht verbunden")
-        if self._is_symbol_on_cooldown(symbol):
-            remaining = self._cooldowns.get(symbol)
-            logger.info(f"[{symbol}] Auslassung: Symbol befindet sich noch im Cooldown bis {remaining}")
-            return
         for signal in signals[: self.cfg.max_open_trades]:
             if self.cfg.use_ml_filters:
                 threshold = self.cfg.ml_probability_threshold + self.cfg.ml_threshold_shift
@@ -195,25 +190,10 @@ class OrderManager:
 
     def _process_execution_result(self, symbol: str, direction: Dir, result: dict) -> bool:
         retcode = result.get("retcode")
-        if retcode != self.SUCCESS_RETCODE:
-            self._enter_cooldown(symbol)
         self._update_symbol_restrictions(symbol, direction, retcode)
         if retcode in self.STOP_AFTER_RETCODES:
             return False
         return True
-
-    def _is_symbol_on_cooldown(self, symbol: str) -> bool:
-        expiry = self._cooldowns.get(symbol)
-        if expiry is None:
-            return False
-        if datetime.utcnow() >= expiry:
-            del self._cooldowns[symbol]
-            return False
-        return True
-
-    def _enter_cooldown(self, symbol: str) -> None:
-        expiry = datetime.utcnow() + timedelta(seconds=self.cfg.order_cooldown_seconds)
-        self._cooldowns[symbol] = expiry
 
     def _is_direction_allowed(self, symbol: str, direction: Dir) -> bool:
         if direction == Dir.DOWN and symbol in self._long_only_symbols:

@@ -249,6 +249,17 @@ class MetaTrader5Adapter:
         if self._mock:
             return []
         try:
-            return [dict(**p) for p in mt5.positions_get(symbol=symbol)]
+            positions = mt5.positions_get(symbol=symbol)
+            if not positions:
+                return []
+            normalized: list[dict] = []
+            for pos in positions:
+                if hasattr(pos, "_asdict"):
+                    normalized.append(pos._asdict())
+                elif hasattr(pos, "__dict__"):
+                    normalized.append({k: v for k, v in pos.__dict__.items() if not k.startswith("_")})
+                else:
+                    normalized.append({})
+            return normalized
         except Exception:
             return []
