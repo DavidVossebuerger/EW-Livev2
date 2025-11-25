@@ -32,9 +32,6 @@ class LiveConfig:
     risk_per_trade_max: float = 0.02
     size_short_factor: float = 1.0
     allow_shorts: bool = False
-    enable_breakeven: bool = True
-    breakeven_tp_ratio: float = 0.66
-    breakeven_sl_buffer: float = 0.0
     use_ml_filters: bool = False
     ml_probability_threshold: float = 0.65
     ml_threshold_shift: float = 0.0

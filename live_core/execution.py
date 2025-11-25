@@ -40,7 +40,6 @@ class OrderManager:
         if not self.adapter.connected:
             raise RuntimeError("MT5 nicht verbunden")
         existing_positions = self.adapter.get_positions(symbol)
-        self._try_move_stop_to_breakeven(symbol, existing_positions)
         limited_signals = signals[: self.cfg.max_open_trades]
         for idx, signal in enumerate(limited_signals):
             open_positions = existing_positions if idx == 0 else self.adapter.get_positions(symbol)
@@ -102,65 +101,6 @@ class OrderManager:
             f"Vol={volume:.3f} (risk={risk_amount:.2f}, stop={stop_distance:.5f},/lot={risk_per_lot:.3f}) -> {result}"
         )
 
-    def _try_move_stop_to_breakeven(self, symbol: str, positions: Optional[List[dict]] = None) -> None:
-        if not self.cfg.enable_breakeven:
-            return
-        pos_list = positions if positions is not None else self.adapter.get_positions(symbol)
-        if not pos_list:
-            return
-        tick = self.adapter.get_symbol_tick(symbol)
-        if not tick:
-            return
-        ratio = max(0.0, min(0.9999, self.cfg.breakeven_tp_ratio))
-        if ratio <= 0.0:
-            return
-        buffer = max(0.0, self.cfg.breakeven_sl_buffer)
-        for pos in pos_list:
-            ticket = pos.get("ticket")
-            if ticket is None:
-                continue
-            try:
-                direction = Dir.UP if int(pos.get("type", 0)) == 0 else Dir.DOWN
-            except (TypeError, ValueError):
-                continue
-            entry = float(pos.get("price_open") or 0.0)
-            tp = float(pos.get("tp") or 0.0)
-            sl = float(pos.get("sl") or 0.0)
-            if entry <= 0.0 or tp <= 0.0:
-                continue
-            tp_distance = tp - entry if direction == Dir.UP else entry - tp
-            if tp_distance <= 0.0:
-                continue
-            trigger_price = entry + ratio * tp_distance if direction == Dir.UP else entry - ratio * tp_distance
-            current_price = tick.get("bid") if direction == Dir.UP else tick.get("ask")
-            if current_price is None:
-                continue
-            if direction == Dir.UP and current_price < trigger_price:
-                continue
-            if direction == Dir.DOWN and current_price > trigger_price:
-                continue
-            target_sl = entry - buffer if direction == Dir.UP else entry + buffer
-            already_be = (direction == Dir.UP and sl >= target_sl - 1e-6) or (
-                direction == Dir.DOWN and sl <= target_sl + 1e-6
-            )
-            if already_be:
-                continue
-            result = self.adapter.modify_position_sl_tp(int(ticket), symbol, target_sl, tp)
-            success = result.get("retcode") == self.SUCCESS_RETCODE or result.get("status") == "mock"
-            if success:
-                logger.info(
-                    f"[{symbol}] SL auf Break-even gesetzt (Ticket={ticket}, Preis={target_sl:.5f})"
-                )
-            else:
-                logger.warning(
-                    f"[{symbol}] SL-Break-even für Ticket {ticket} fehlgeschlagen: "
-                    f"{result.get('retcode_description', result)}"
-                )
-        self._log_adjustment(symbol, result)
-        self._log_filling_mode(symbol, result)
-        self._log_retcode_info(symbol, result)
-        self._notify_webhook(symbol, signal, result, volume, risk_amount, risk_per_lot, stop_distance)
-        self._record_expected_return(signal)
 
     def _log_retcode_info(self, symbol: str, result: dict) -> None:
         status = result.get("status")
