@@ -96,6 +96,21 @@ class MetaTrader5Adapter:
             self._symbol_cache[symbol] = info
         return info
 
+    def get_symbol_tick(self, symbol: str) -> Optional[Dict[str, float]]:
+        if self._mock:
+            return {"bid": 0.0, "ask": 0.0, "last": 0.0}
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                return None
+            return {
+                "bid": getattr(tick, "bid", None),
+                "ask": getattr(tick, "ask", None),
+                "last": getattr(tick, "last", None),
+            }
+        except Exception:
+            return None
+
 
     def get_rates(self, symbol: str, timeframe: str, bars: int) -> List[dict]:
         if self._mock:
@@ -244,6 +259,26 @@ class MetaTrader5Adapter:
         except Exception as exc:
             print(f"[MT5] Order fehlgeschlagen: {exc}")
             return {"symbol": symbol, "volume": volume, "direction": direction, "sl": sl, "tp": tp, "status": "fallback"}
+
+    def modify_position_sl_tp(self, ticket: int, symbol: str, sl: Optional[float], tp: Optional[float]) -> dict:
+        if self._mock:
+            return {"status": "mock", "ticket": ticket, "sl": sl, "tp": tp}
+        try:
+            request: dict[str, Any] = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": symbol,
+                "position": ticket,
+            }
+            if sl is not None:
+                request["sl"] = sl
+            if tp is not None:
+                request["tp"] = tp
+            result = self._send_request(request)
+            result["retcode_description"] = self.describe_retcode(result.get("retcode"))
+            return result
+        except Exception as exc:
+            print(f"[MT5] SL/TP-Anpassung fehlgeschlagen: {exc}")
+            return {"status": "fallback", "ticket": ticket, "sl": sl, "tp": tp}
 
     def get_positions(self, symbol: Optional[str] = None) -> List[dict]:
         if self._mock:
