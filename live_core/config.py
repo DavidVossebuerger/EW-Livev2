@@ -42,6 +42,9 @@ class LiveConfig:
     entry_buffer_atr: float = 0.25
     stop_loss_multiplier: float = 1.5
     take_profit_multiplier: float = 1.0
+    min_stop_distance_pct: float = 0.0008
+    trade_cooldown_minutes: int = 10
+    max_trades_per_symbol_per_hour: int = 2
     atr_period: int = 14
     ema_fast: int = 34
     ema_slow: int = 144
@@ -57,7 +60,7 @@ class LiveConfig:
     h1_zz_pct: float = 0.0020
     h1_zz_atr_mult: float = 0.6
     h1_min_imp_atr: float = 1.6
-    webhook_url: Optional[str] = "https://discord.com/api/webhooks/1443245421857214660/Mp8vdAMLUKLd6qRHLKs0QEoU8Jux60QEY0ZG4nXXaIjjV0r2p2yv-bJQQeuU4C6BcxA4"
+    webhook_url: Optional[str] = None
     entry_zone_w3: Tuple[float, float] = (0.382, 0.786)
     entry_zone_w5: Tuple[float, float] = (0.236, 0.618)
     entry_zone_c: Tuple[float, float] = (0.382, 0.786)

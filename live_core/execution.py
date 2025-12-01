@@ -1,15 +1,17 @@
 """Order-Manager für das Live-System, trifft Entscheidungen basierend auf Signalen."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import ssl
 import urllib.request
-from collections import deque
-from datetime import datetime, timezone
+from collections import defaultdict, deque
+from datetime import datetime, timezone, timedelta
 from statistics import pstdev, StatisticsError
 from typing import Any, Dict, Deque, List, Optional, Tuple
+from urllib.error import HTTPError
 
 import certifi
 
@@ -38,6 +40,11 @@ class OrderManager:
         self._highest_balance: float = cfg.account_balance
         self._recent_returns: Deque[float] = deque(maxlen=cfg.vol_window_trades)
         self._last_confidence: Dict[str, float] = {}
+        self._recent_trade_times: Dict[str, Deque[datetime]] = defaultdict(deque)
+        self._last_trade_time: Dict[str, datetime] = {}
+        self._webhook_fingerprint = self._compute_webhook_fingerprint(cfg.webhook_url)
+        if self._webhook_fingerprint:
+            logger.info(f"Webhook aktiviert (Fingerprint={self._webhook_fingerprint})")
 
     def evaluate_signals(self, symbol: str, signals: List[EntrySignal]) -> None:
         if not signals:
@@ -70,11 +77,32 @@ class OrderManager:
                         f"Confidence {confidence:.3f} nicht um 7% gestiegen (letzte: {last_conf:.3f})"
                     )
                     continue
+            if self._trade_limit_hit(symbol):
+                logger.info(
+                    f"[{symbol}] Signal {signal.setup} {signal.direction} übersprungen: Max "
+                    f"{self.cfg.max_trades_per_symbol_per_hour} Trades/Std erreicht"
+                )
+                continue
+            cooldown_remaining = self._cooldown_remaining(symbol)
+            if cooldown_remaining is not None:
+                minutes = cooldown_remaining.total_seconds() / 60.0
+                logger.info(
+                    f"[{symbol}] Signal {signal.setup} {signal.direction} übersprungen: Cooldown aktiv "
+                    f"({minutes:.1f}m verbleibend)"
+                )
+                continue
             info = self.adapter.get_symbol_info(symbol)
             if info is None:
                 logger.warning(f"[{symbol}] Keine Symbolinformationen verfügbar -> Signal übersprungen")
                 continue
             stop_price, take_profit = self._scale_order_levels(signal)
+            stop_ok, required, actual = self._validate_stop_distance(signal.entry_price, stop_price)
+            if not stop_ok:
+                logger.info(
+                    f"[{symbol}] Signal {signal.setup} {signal.direction} übersprungen: Stop-Distanz {actual:.5f} < "
+                    f"Mindestabstand {required:.5f}"
+                )
+                continue
             current_price = self._current_price(symbol, signal.direction)
             if current_price is None:
                 logger.warning(f"[{symbol}] Kein aktueller Preis verfügbar -> Signal übersprungen")
@@ -247,6 +275,15 @@ class OrderManager:
             parts.append(f"Abstand {actual:.6f} < {required:.6f}")
         logger.info(f"[{symbol}] Order übersprungen: {' | '.join(parts)}")
 
+    def _validate_stop_distance(self, entry_price: float, stop_price: float) -> Tuple[bool, float, float]:
+        min_pct = max(0.0, self.cfg.min_stop_distance_pct)
+        if min_pct <= 0 or not math.isfinite(entry_price) or not math.isfinite(stop_price):
+            return True, 0.0, 0.0
+        baseline = max(abs(entry_price), 1e-9)
+        required = baseline * min_pct
+        actual = abs(entry_price - stop_price)
+        return actual >= required, required, actual
+
     def _notify_webhook(
         self,
         symbol: str,
@@ -285,11 +322,28 @@ class OrderManager:
         context = ssl.create_default_context(cafile=certifi.where())
         try:
             urllib.request.urlopen(request, timeout=5, context=context)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
+            body = body.strip().replace("\n", " ")
+            detail = f"HTTP {exc.code}: {exc.reason}"
+            if body:
+                detail = f"{detail} | {body}"
+            fp = self._webhook_fingerprint or "unknown"
+            logger.warning(f"[{symbol}] Webhook fehlgeschlagen ({detail}) [fp={fp}]")
         except Exception as exc:
-            logger.warning(f"[{symbol}] Webhook-Benachrichtigung fehlgeschlagen: {exc}")
+            fp = self._webhook_fingerprint or "unknown"
+            logger.warning(f"[{symbol}] Webhook-Benachrichtigung fehlgeschlagen: {exc} [fp={fp}]")
+
+    @staticmethod
+    def _compute_webhook_fingerprint(url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
 
     def _process_execution_result(self, symbol: str, direction: Dir, result: dict) -> bool:
         retcode = result.get("retcode")
+        if retcode == self.SUCCESS_RETCODE:
+            self._register_successful_trade(symbol)
         self._update_symbol_restrictions(symbol, direction, result)
         if retcode in self.STOP_AFTER_RETCODES:
             return False
@@ -434,3 +488,33 @@ class OrderManager:
                 f"[{symbol}] Volume an Symbol-Limits angepasst: {normalized:.3f} (min={min_vol:.3f}, max={max_vol:.3f}, step={step:.5f})"
             )
         return normalized
+
+    def _cooldown_remaining(self, symbol: str) -> Optional[timedelta]:
+        cooldown = self.cfg.trade_cooldown_minutes
+        if cooldown <= 0:
+            return None
+        last_trade = self._last_trade_time.get(symbol)
+        if not last_trade:
+            return None
+        remaining = timedelta(minutes=cooldown) - (datetime.now(timezone.utc) - last_trade)
+        return remaining if remaining.total_seconds() > 0 else None
+
+    def _trade_limit_hit(self, symbol: str) -> bool:
+        limit = self.cfg.max_trades_per_symbol_per_hour
+        if limit <= 0:
+            return False
+        history = self._prune_trade_history(symbol, timedelta(hours=1))
+        return len(history) >= limit
+
+    def _register_successful_trade(self, symbol: str) -> None:
+        now = datetime.now(timezone.utc)
+        history = self._prune_trade_history(symbol, timedelta(hours=1))
+        history.append(now)
+        self._last_trade_time[symbol] = now
+
+    def _prune_trade_history(self, symbol: str, window: timedelta) -> Deque[datetime]:
+        history = self._recent_trade_times.setdefault(symbol, deque())
+        cutoff = datetime.now(timezone.utc) - window
+        while history and history[0] < cutoff:
+            history.popleft()
+        return history
