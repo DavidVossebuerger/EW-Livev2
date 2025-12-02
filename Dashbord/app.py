@@ -238,6 +238,17 @@ def _timeline_frequency(span: pd.Timedelta) -> str:
 
 def main() -> None:
     st.title("EW Live – Monitoring Dashboard")
+    st.markdown(
+        """
+> **Haftungsausschluss**  
+> Dieses Dashboard dient ausschließlich zu privaten Analysezwecken. Es stellt **keine Anlageberatung, keine
+> Aufforderung zum Kauf/Verkauf** von Finanzinstrumenten und keine Zusicherung zukünftiger Ergebnisse dar. Alle Daten
+> stammen aus einem inoffiziellen Projekt-Setup; Nutzung nur auf eigenes Risiko.
+        """
+    )
+    if not st.checkbox("Ich bestätige, dass ich den Hinweis gelesen habe und trotzdem fortfahre.", value=False):
+        st.warning("Bitte bestätige zuerst den Hinweis, um das Dashboard zu verwenden.")
+        return
 
     with st.sidebar:
         st.header("Logquelle")
