@@ -173,6 +173,12 @@ def _render_totp_qr(secret: str, email: str) -> None:
     st.image(buffer, caption="Diet einen QR-Code in deinen Authenticator", use_column_width=True)
 
 
+def _rerun_app() -> None:
+    rerun_func = getattr(st, "experimental_rerun", None) or getattr(st, "rerun", None)
+    if rerun_func:
+        rerun_func()
+
+
 @st.cache_data(show_spinner=False)
 def load_log_entries(log_path: str, max_files: Optional[int]) -> pd.DataFrame:
     """Parse the execution log into a normalized DataFrame."""
@@ -395,7 +401,7 @@ def _render_login_screen(initial_secret: Optional[str]) -> None:
             st.session_state.user_email = email
             st.session_state.is_admin = bool(row["is_admin"])
             st.session_state.login_error = ""
-            st.experimental_rerun()
+            _rerun_app()
         else:
             st.session_state.login_error = message
 
@@ -466,7 +472,7 @@ def main() -> None:
     if st.sidebar.button("Abmelden"):
         for key in ("authenticated", "user_email", "is_admin", "login_error"):
             st.session_state[key] = False if key == "authenticated" else "" if key != "is_admin" else False
-        st.experimental_rerun()
+        _rerun_app()
 
     st.title("EW Live – Monitoring Dashboard")
     st.markdown(
