@@ -96,6 +96,13 @@ class OrderManager:
                 logger.warning(f"[{symbol}] Keine Symbolinformationen verfügbar -> Signal übersprungen")
                 continue
             stop_price, take_profit = self._scale_order_levels(signal)
+            pf_ok, pf_value = self._profit_factor_ok(signal.entry_price, stop_price, take_profit)
+            if not pf_ok:
+                logger.info(
+                    f"[{symbol}] Signal {signal.setup} {signal.direction} übersprungen: Chance/Risiko {pf_value:.2f} < "
+                    f"Mindestfaktor {self.cfg.min_profit_factor:.2f}"
+                )
+                continue
             stop_ok, required, actual = self._validate_stop_distance(signal.entry_price, stop_price)
             if not stop_ok:
                 logger.info(
@@ -110,6 +117,9 @@ class OrderManager:
             if not self._price_supports_order(symbol, signal.direction, current_price, stop_price, take_profit):
                 continue
             volume, risk_amount, risk_per_lot, stop_distance = self._calculate_volume(symbol, signal, info, stop_price)
+            trade_notional = self._notional_value(symbol, volume, current_price, info)
+            if not self._within_exposure_limit(symbol, trade_notional):
+                continue
             direction = signal.direction.value if isinstance(signal.direction, Dir) else signal.direction
             try:
                 result = self.adapter.place_market_order(
@@ -275,6 +285,17 @@ class OrderManager:
             parts.append(f"Abstand {actual:.6f} < {required:.6f}")
         logger.info(f"[{symbol}] Order übersprungen: {' | '.join(parts)}")
 
+    def _profit_factor_ok(self, entry: float, stop_price: float, take_profit: float) -> Tuple[bool, float]:
+        min_factor = max(0.0, self.cfg.min_profit_factor)
+        if min_factor <= 0:
+            return True, float("inf")
+        stop_distance = abs(entry - stop_price)
+        tp_distance = abs(take_profit - entry)
+        if stop_distance <= 0:
+            return False, 0.0
+        factor = tp_distance / stop_distance if stop_distance > 0 else 0.0
+        return factor >= min_factor, factor
+
     def _validate_stop_distance(self, entry_price: float, stop_price: float) -> Tuple[bool, float, float]:
         min_pct = max(0.0, self.cfg.min_stop_distance_pct)
         if min_pct <= 0 or not math.isfinite(entry_price) or not math.isfinite(stop_price):
@@ -283,6 +304,40 @@ class OrderManager:
         required = baseline * min_pct
         actual = abs(entry_price - stop_price)
         return actual >= required, required, actual
+
+    def _within_exposure_limit(self, symbol: str, additional_notional: float) -> bool:
+        limit_pct = max(0.0, self.cfg.max_gross_exposure_pct)
+        if limit_pct <= 0:
+            return True
+        balance = self._refresh_account_balance()
+        allowed = balance * limit_pct
+        current = self._current_gross_exposure()
+        projected = current + max(0.0, additional_notional)
+        if projected > allowed:
+            logger.info(
+                f"[{symbol}] Signal übersprungen: Exponierung {projected:.2f} > Limit {allowed:.2f} (max {limit_pct*100:.2f}% vom Konto)"
+            )
+            return False
+        return True
+
+    def _current_gross_exposure(self) -> float:
+        positions = self.adapter.get_positions()
+        total = 0.0
+        for pos in positions:
+            symbol = pos.get("symbol")
+            volume = abs(float(pos.get("volume", 0.0) or 0.0))
+            price = float(pos.get("price_current") or pos.get("price_open") or 0.0)
+            if not symbol or volume <= 0 or price <= 0:
+                continue
+            info = self.adapter.get_symbol_info(symbol)
+            total += self._notional_value(symbol, volume, price, info)
+        return total
+
+    def _notional_value(self, symbol: str, volume: float, price: float, info: Optional[Any]) -> float:
+        if not symbol or volume <= 0 or price <= 0:
+            return 0.0
+        contract_size = getattr(info, "trade_contract_size", None) or getattr(info, "contract_size", None) or 1.0
+        return abs(volume) * float(contract_size) * price
 
     def _notify_webhook(
         self,
