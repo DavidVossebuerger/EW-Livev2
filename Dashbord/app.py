@@ -39,6 +39,59 @@ STOP_DIST_PATTERN = re.compile(r"Stop-Distanz\s+([0-9.,]+)\s+<\s+Mindestabstand\
 CONFIDENCE_PATTERN = re.compile(r"Confidence\s+([0-9.,]+)\s+<\s+Threshold\s+([0-9.,]+)")
 COOLDOWN_PATTERN = re.compile(r"Cooldown aktiv\s+\(([0-9.,]+)m verbleibend\)")
 CYCLE_DURATION_PATTERN = re.compile(r"Dauer=([0-9.,]+)s")
+ENTRY_SIGNAL_PATTERN = re.compile(r"LastEntry=EntrySignal\((?P<payload>[^)]*)\)")
+ENTRY_TIME_PATTERN = re.compile(r"entry_time=Timestamp\('(?P<entry_time>[^']+)'\)")
+ENTRY_DIRECTION_PATTERN = re.compile(r"direction=<Dir\.\w+:\s*'(?P<direction>[A-Z]+)'\>")
+
+
+def _apply_dark_theme() -> None:
+    css = """
+    <style>
+    :root {
+        color-scheme: dark;
+    }
+    body {
+        background: #03040a;
+        color: #f6f7fb;
+    }
+    .stApp, .main .block-container {
+        background-color: #03040a;
+        color: #f6f7fb;
+    }
+    .stSidebar {
+        background-color: #0a0c16;
+        color: #f6f7fb;
+    }
+    .stMetric > div {
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(11, 12, 17, 0.7));
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+        transition: transform 0.35s ease, box-shadow 0.35s ease;
+    }
+    .stMetric > div:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.65);
+    }
+    .animated-panel {
+        animation: fadeIn 0.7s ease-out;
+        border-radius: 14px;
+    }
+    .chart-panel {
+        padding: 12px 16px;
+        border-radius: 14px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(15, 17, 25, 0.9);
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(12px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+
+_apply_dark_theme()
 
 
 def _default_segment_dir() -> Path:
@@ -368,6 +421,65 @@ def _safe_float(value: str) -> Optional[float]:
         return None
 
 
+def _extract_numeric(payload: str, field: str) -> Optional[float]:
+    match = re.search(fr"{field}=([0-9.,]+)", payload)
+    return _safe_float(match.group(1)) if match else None
+
+
+def _parse_entry_signal(payload: str) -> Optional[dict]:
+    time_match = ENTRY_TIME_PATTERN.search(payload)
+    direction_match = ENTRY_DIRECTION_PATTERN.search(payload)
+    if not time_match or not direction_match:
+        return None
+
+    entry_time = pd.Timestamp(time_match.group("entry_time"))
+    entry_time = entry_time.tz_localize("UTC") if entry_time.tzinfo is None else entry_time
+    return {
+        "entry_time": entry_time,
+        "direction": direction_match.group("direction"),
+        "entry_price": _extract_numeric(payload, "entry_price"),
+        "stop_loss": _extract_numeric(payload, "stop_loss"),
+        "take_profit": _extract_numeric(payload, "take_profit"),
+        "confidence": _extract_numeric(payload, "confidence"),
+        "setup": _extract_string_value(payload, "setup"),
+    }
+
+
+def _extract_string_value(payload: str, field: str) -> Optional[str]:
+    match = re.search(fr"{field}='([^']+)'", payload)
+    return match.group(1) if match else None
+
+
+def _prepare_entry_signals(df: pd.DataFrame) -> pd.DataFrame:
+    entries: List[dict] = []
+    mask = df["message"].str.contains("LastEntry=EntrySignal", na=False)
+    for _, row in df[mask].iterrows():
+        payload_match = ENTRY_SIGNAL_PATTERN.search(row["message"])
+        if not payload_match:
+            continue
+        info = _parse_entry_signal(payload_match.group("payload"))
+        if not info:
+            continue
+        info["symbol"] = row["symbol"] or "unknown"
+        info["log_timestamp"] = row["timestamp"]
+        info["source_file"] = row.get("source", "")
+        entries.append(info)
+    if not entries:
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "entry_time",
+                "direction",
+                "entry_price",
+                "stop_loss",
+                "take_profit",
+                "confidence",
+                "setup",
+                "log_timestamp",
+                "source_file",
+            ]
+        )
+    return pd.DataFrame(entries)
 def _timeline_frequency(span: pd.Timedelta) -> str:
     if span <= pd.Timedelta(hours=12):
         return "30min"
@@ -558,10 +670,12 @@ def main() -> None:
     if category_filter:
         filtered = filtered[filtered["category"].isin(category_filter)]
 
+    entry_signals = _prepare_entry_signals(filtered)
+
     if filtered.empty:
         st.warning("Für die aktuellen Filter liegen keine Einträge vor.")
 
-    overview_tab, insights_tab, raw_tab = st.tabs(["Übersicht", "Insights", "Rohdaten"])
+    overview_tab, insights_tab, signal_tab, raw_tab = st.tabs(["Übersicht", "Insights", "MT5 Signale", "Rohdaten"])
 
     with overview_tab:
         cycles = filtered[filtered["category"] == "Cycle"]
@@ -611,37 +725,54 @@ def main() -> None:
     with insights_tab:
         st.subheader("Skips im Zeitverlauf")
         timeline_source = filtered[filtered["timestamp"].notna()].copy()
+        detail_source: pd.DataFrame
         if timeline_source.empty:
             st.write("Keine Zeitinformationen vorhanden.")
+            detail_source = pd.DataFrame()
         else:
-            span = timeline_source["timestamp"].max() - timeline_source["timestamp"].min()
-            freq = _timeline_frequency(span)
-            timeline = (
-                timeline_source.set_index("timestamp")
-                .assign(count=1)
-                .groupby([pd.Grouper(freq=freq), "category"])
-                .size()
-                .reset_index(name="Anzahl")
+            hours_back = st.slider(
+                "Blick zurück (Stunden)",
+                min_value=6,
+                max_value=168,
+                value=48,
+                step=6,
+                key="insights_hours",
             )
-            chart = (
-                alt.Chart(timeline)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X("timestamp:T", title="Zeit"),
-                    y=alt.Y("Anzahl:Q", title="Skip-Anzahl"),
-                    color=alt.Color("category:N", title="Kategorie"),
-                    tooltip=["timestamp:T", "category:N", "Anzahl:Q"],
+            window_start = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(hours=hours_back)
+            detail_source = timeline_source[timeline_source["timestamp"] >= window_start]
+            if detail_source.empty:
+                st.warning("Für den gewählten Zeitraum liegen keine Einträge vor.")
+            else:
+                span = detail_source["timestamp"].max() - detail_source["timestamp"].min()
+                freq = _timeline_frequency(span)
+                timeline = (
+                    detail_source.set_index("timestamp")
+                    .assign(count=1)
+                    .groupby([pd.Grouper(freq=freq), "category"])
+                    .size()
+                    .reset_index(name="Anzahl")
                 )
-                .properties(height=320)
-            )
-            st.altair_chart(chart, use_container_width=True)
+                chart = (
+                    alt.Chart(timeline)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("timestamp:T", title="Zeit"),
+                        y=alt.Y("Anzahl:Q", title="Skip-Anzahl"),
+                        color=alt.Color("category:N", title="Kategorie"),
+                        tooltip=["timestamp:T", "category:N", "Anzahl:Q"],
+                    )
+                    .properties(height=320)
+                )
+                st.markdown('<div class="animated-panel chart-panel">', unsafe_allow_html=True)
+                st.altair_chart(chart, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
 
         st.subheader("Stündliche Skip-Verteilung")
-        if timeline_source.empty:
+        if detail_source.empty:
             st.write("Nicht genug Zeitdaten für die stündliche Auswertung.")
         else:
             hourly = (
-                timeline_source.assign(hour=timeline_source["timestamp"].dt.hour)
+                detail_source.assign(hour=detail_source["timestamp"].dt.hour)
                 .groupby("hour")
                 .size()
                 .reset_index(name="Anzahl")
@@ -656,7 +787,9 @@ def main() -> None:
                 )
                 .properties(height=260)
             )
+            st.markdown('<div class="animated-panel chart-panel">', unsafe_allow_html=True)
             st.altair_chart(hourly_chart, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
 
         st.subheader("Kategorie-Anteile")
         category_counts = filtered[filtered["category"].notna()]["category"]
@@ -675,7 +808,9 @@ def main() -> None:
                 )
                 .properties(height=320)
             )
+            st.markdown('<div class="animated-panel chart-panel">', unsafe_allow_html=True)
             st.altair_chart(cat_chart, use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
 
         st.subheader("Cycle-Dauer")
         cycle_df = filtered[(filtered["symbol"] == "cycle") & filtered["cycle_duration"].notna()]
@@ -790,6 +925,84 @@ def main() -> None:
                 price_df["price_relation"].fillna("Unbekannt").value_counts().rename_axis("Barriere").reset_index(name="Anzahl")
             )
             st.bar_chart(relation_counts, x="Barriere", y="Anzahl")
+
+    with signal_tab:
+        st.subheader("MT5 Entry-Signale")
+        st.caption("Die folgenden Signale werden direkt aus den MT5-Logs über LastEntry=EntrySignal gewonnen.")
+        if entry_signals.empty:
+            st.info("Noch keine MT5-Entry-Signale im aktuellen Filter.")
+        else:
+            symbols = ["Alle"] + sorted(entry_signals["symbol"].dropna().unique())
+            selected_symbol = st.selectbox("Symbol auswählen", symbols)
+            directions = sorted(entry_signals["direction"].dropna().unique())
+            direction_filter = st.multiselect("Richtung", directions, default=directions)
+            max_limit = max(5, len(entry_signals))
+            limit = st.slider(
+                "Anzahl der Einträge",
+                min_value=1,
+                max_value=max_limit,
+                value=min(max_limit, 20),
+                step=1,
+                key="signal_limit",
+            )
+            chart_source = entry_signals
+            if selected_symbol != "Alle":
+                chart_source = chart_source[chart_source["symbol"] == selected_symbol]
+            if direction_filter:
+                chart_source = chart_source[chart_source["direction"].isin(direction_filter)]
+            chart_source = chart_source.sort_values("entry_time")
+            chart_source = chart_source.tail(limit)
+            if chart_source.empty:
+                st.warning("Keine Signale für die aktuelle Kombination.")
+            else:
+                melt = (
+                    chart_source[
+                        ["entry_time", "entry_price", "stop_loss", "take_profit"]
+                    ]
+                    .melt(id_vars="entry_time", var_name="type", value_name="price")
+                    .dropna()
+                )
+                signal_chart = (
+                    alt.Chart(melt)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("entry_time:T", title="Entry-Zeit"),
+                        y=alt.Y("price:Q", title="Preis"),
+                        color=alt.Color("type:N", title="Typ"),
+                        tooltip=["type:N", "price:Q", "entry_time:T"],
+                    )
+                    .properties(height=360)
+                    .interactive()
+                )
+                st.markdown('<div class="animated-panel chart-panel">', unsafe_allow_html=True)
+                st.altair_chart(signal_chart, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+                metric_cols = st.columns(3)
+                avg_entry = chart_source["entry_price"].mean()
+                avg_stop = chart_source["stop_loss"].mean()
+                avg_tp = chart_source["take_profit"].mean()
+                metric_cols[0].metric("Ø Entry-Preis", f"{avg_entry:.2f}" if pd.notna(avg_entry) else "-")
+                metric_cols[1].metric("Ø Stop-Loss", f"{avg_stop:.2f}" if pd.notna(avg_stop) else "-")
+                metric_cols[2].metric("Ø Take-Profit", f"{avg_tp:.2f}" if pd.notna(avg_tp) else "-")
+                st.subheader("Letzte Signale")
+                display_df = chart_source.copy()
+                display_df["entry_time"] = display_df["entry_time"].dt.strftime("%Y-%m-%d %H:%M")
+                st.dataframe(
+                    display_df[
+                        ["symbol", "direction", "entry_time", "entry_price", "stop_loss", "take_profit", "confidence"]
+                    ]
+                    .rename(columns={
+                        "symbol": "Symbol",
+                        "direction": "Richtung",
+                        "entry_time": "Entry-Zeit",
+                        "entry_price": "Entry",
+                        "stop_loss": "Stop",
+                        "take_profit": "TP",
+                        "confidence": "Confidence",
+                    }),
+                    hide_index=True,
+                )
+                st.caption("Nutze diese Übersicht, um genau zu sehen, welche MT5-Signale zuletzt berechnet wurden und welche Preisziele der Bot im Blick hatte.")
 
     with raw_tab:
         st.subheader("Letzte Ereignisse")
