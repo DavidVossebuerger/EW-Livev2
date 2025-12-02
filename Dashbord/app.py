@@ -748,6 +748,7 @@ def main() -> None:
         else:
             cat_summary = category_counts.value_counts().reset_index(name="Anzahl")
             cat_summary.rename(columns={"index": "Kategorie"}, inplace=True)
+            cat_summary["Kategorie"] = cat_summary["Kategorie"].astype(str)
             cat_chart = (
                 alt.Chart(cat_summary)
                 .mark_arc(innerRadius=40)
