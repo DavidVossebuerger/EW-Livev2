@@ -575,6 +575,16 @@ def main() -> None:
         block_ratio = f"{(broker_blocks / total_events * 100):.1f}%" if total_events else "0%"
         col4.metric("Broker-Blocks", block_ratio)
 
+        symbol_series = filtered[filtered["symbol"].notna()]["symbol"]
+        if symbol_series.empty:
+            top_symbol = "-"
+            top_symbol_count = "0"
+        else:
+            most_common = symbol_series.value_counts()
+            top_symbol = most_common.idxmax()
+            top_symbol_count = int(most_common.max())
+        st.metric("Top-Symbol (Skips)", top_symbol, f"{top_symbol_count} Ereignisse")
+
         st.subheader("Skip-Gründe")
         tracked_categories = {
             "Profit-Faktor",
@@ -625,6 +635,47 @@ def main() -> None:
                 .properties(height=320)
             )
             st.altair_chart(chart, use_container_width=True)
+
+        st.subheader("Stündliche Skip-Verteilung")
+        if timeline_source.empty:
+            st.write("Nicht genug Zeitdaten für die stündliche Auswertung.")
+        else:
+            hourly = (
+                timeline_source.assign(hour=timeline_source["timestamp"].dt.hour)
+                .groupby("hour")
+                .size()
+                .reset_index(name="Anzahl")
+            )
+            hourly_chart = (
+                alt.Chart(hourly)
+                .mark_bar()
+                .encode(
+                    x=alt.X("hour:O", title="Stunde"),
+                    y=alt.Y("Anzahl:Q", title="Anzahl Skips"),
+                    tooltip=["hour:O", "Anzahl:Q"],
+                )
+                .properties(height=260)
+            )
+            st.altair_chart(hourly_chart, use_container_width=True)
+
+        st.subheader("Kategorie-Anteile")
+        category_counts = filtered[filtered["category"].notna()]["category"]
+        if category_counts.empty:
+            st.write("Keine Kategorien für diese Auswahl verfügbar.")
+        else:
+            cat_summary = category_counts.value_counts().reset_index(name="Anzahl")
+            cat_summary.rename(columns={"index": "Kategorie"}, inplace=True)
+            cat_chart = (
+                alt.Chart(cat_summary)
+                .mark_arc(innerRadius=40)
+                .encode(
+                    theta=alt.Theta("Anzahl:Q", title="Anteil"),
+                    color=alt.Color("Kategorie:N", title="Kategorie"),
+                    tooltip=["Kategorie", "Anzahl:Q"],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(cat_chart, use_container_width=True)
 
         st.subheader("Cycle-Dauer")
         cycle_df = filtered[(filtered["symbol"] == "cycle") & filtered["cycle_duration"].notna()]
