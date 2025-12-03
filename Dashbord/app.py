@@ -7,7 +7,7 @@ import secrets
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import altair as alt
 import pandas as pd
@@ -42,6 +42,7 @@ CYCLE_DURATION_PATTERN = re.compile(r"Dauer=([0-9.,]+)s")
 ENTRY_SIGNAL_PATTERN = re.compile(r"LastEntry=EntrySignal\((?P<payload>[^)]*)\)")
 ENTRY_TIME_PATTERN = re.compile(r"entry_time=Timestamp\('(?P<entry_time>[^']+)'\)")
 ENTRY_DIRECTION_PATTERN = re.compile(r"direction=<Dir\.\w+:\s*'(?P<direction>[A-Z]+)'\>")
+ENTRY_ZONE_PATTERN = re.compile(r"entry_zone=\((?P<low>[0-9.,+-]+),\s*(?P<high>[0-9.,+-]+)\)")
 
 
 def _default_segment_dir() -> Path:
@@ -384,6 +385,7 @@ def _parse_entry_signal(payload: str) -> Optional[dict]:
 
     entry_time = pd.Timestamp(time_match.group("entry_time"))
     entry_time = entry_time.tz_localize("UTC") if entry_time.tzinfo is None else entry_time
+    zone = _extract_entry_zone(payload)
     return {
         "entry_time": entry_time,
         "direction": direction_match.group("direction"),
@@ -392,12 +394,25 @@ def _parse_entry_signal(payload: str) -> Optional[dict]:
         "take_profit": _extract_numeric(payload, "take_profit"),
         "confidence": _extract_numeric(payload, "confidence"),
         "setup": _extract_string_value(payload, "setup"),
+        **({"entry_zone": zone, "entry_zone_low": zone[0], "entry_zone_high": zone[1]} if zone else {}),
+        "entry_tf": _extract_string_value(payload, "entry_tf"),
     }
 
 
 def _extract_string_value(payload: str, field: str) -> Optional[str]:
     match = re.search(fr"{field}='([^']+)'", payload)
     return match.group(1) if match else None
+
+
+def _extract_entry_zone(payload: str) -> Optional[Tuple[float, float]]:
+    match = ENTRY_ZONE_PATTERN.search(payload)
+    if not match:
+        return None
+    low = _safe_float(match.group("low"))
+    high = _safe_float(match.group("high"))
+    if low is None or high is None:
+        return None
+    return (low, high)
 
 
 def _prepare_entry_signals(df: pd.DataFrame) -> pd.DataFrame:
@@ -427,6 +442,10 @@ def _prepare_entry_signals(df: pd.DataFrame) -> pd.DataFrame:
                 "setup",
                 "log_timestamp",
                 "source_file",
+                "entry_zone",
+                "entry_zone_low",
+                "entry_zone_high",
+                "entry_tf",
             ]
         )
     return pd.DataFrame(entries)

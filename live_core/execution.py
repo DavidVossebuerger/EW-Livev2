@@ -107,21 +107,49 @@ class OrderManager:
             if current_price is None:
                 logger.warning(f"[{symbol}] Kein aktueller Preis verfügbar -> Signal übersprungen")
                 continue
-            if not self._price_supports_order(symbol, signal.direction, current_price, stop_price, take_profit):
+            execution_price = current_price
+            pending_price = self._pending_limit_price(signal)
+            use_pending_order = False
+            if self.cfg.use_pending_orders and pending_price is not None:
+                if self._pending_price_allowed(pending_price, current_price, signal.direction):
+                    execution_price = pending_price
+                    use_pending_order = True
+            if not self._price_supports_order(symbol, signal.direction, execution_price, stop_price, take_profit):
                 continue
-            volume, risk_amount, risk_per_lot, stop_distance = self._calculate_volume(symbol, signal, info, stop_price)
-            trade_notional = self._notional_value(symbol, volume, current_price, info)
+            volume, risk_amount, risk_per_lot, stop_distance = self._calculate_volume(
+                symbol, signal, info, stop_price, execution_price
+            )
+            trade_notional = self._notional_value(symbol, volume, execution_price, info)
             if not self._within_exposure_limit(symbol, trade_notional):
                 continue
             direction = signal.direction.value if isinstance(signal.direction, Dir) else signal.direction
             try:
-                result = self.adapter.place_market_order(
-                    symbol=symbol,
-                    volume=volume,
-                    direction=direction,
-                    sl=stop_price,
-                    tp=take_profit,
-                )
+                if use_pending_order:
+                    expiration_ts = None
+                    if self.cfg.pending_order_expiry_minutes > 0:
+                        expiration_ts = int(
+                            (
+                                datetime.utcnow()
+                                + timedelta(minutes=self.cfg.pending_order_expiry_minutes)
+                            ).timestamp()
+                        )
+                    result = self.adapter.place_limit_order(
+                        symbol=symbol,
+                        volume=volume,
+                        direction=direction,
+                        price=execution_price,
+                        sl=stop_price,
+                        tp=take_profit,
+                        expiration=expiration_ts,
+                    )
+                else:
+                    result = self.adapter.place_market_order(
+                        symbol=symbol,
+                        volume=volume,
+                        direction=direction,
+                        sl=stop_price,
+                        tp=take_profit,
+                    )
                 self._log_order(
                     symbol,
                     signal,
@@ -132,6 +160,8 @@ class OrderManager:
                     stop_distance,
                     stop_price,
                     take_profit,
+                    execution_price,
+                    "pending" if use_pending_order else "market",
                 )
                 self._log_adjustment(symbol, result)
                 self._log_filling_mode(symbol, result)
@@ -146,8 +176,10 @@ class OrderManager:
                     stop_distance,
                     stop_price,
                     take_profit,
+                    execution_price,
+                    "pending" if use_pending_order else "market",
                 )
-                self._record_expected_return(signal.entry_price, stop_price, take_profit)
+                self._record_expected_return(execution_price, stop_price, take_profit)
                 should_continue = self._process_execution_result(symbol, signal.direction, result)
                 if result.get("retcode") == self.SUCCESS_RETCODE:
                     self._last_confidence[symbol] = confidence
@@ -191,6 +223,21 @@ class OrderManager:
                 return False
         return True
 
+    def _pending_limit_price(self, signal: EntrySignal) -> Optional[float]:
+        zone = signal.entry_zone
+        if not zone:
+            return None
+        low, high = zone
+        if not (math.isfinite(low) and math.isfinite(high)):
+            return None
+        return high if signal.direction == Dir.UP else low
+
+    def _pending_price_allowed(self, limit_price: float, current_price: float, direction: Dir) -> bool:
+        eps = 1e-6
+        if direction == Dir.UP:
+            return limit_price <= current_price - eps
+        return limit_price >= current_price + eps
+
     def _scale_order_levels(self, signal: EntrySignal) -> Tuple[float, float]:
         entry = signal.entry_price
         stop = signal.stop_loss
@@ -224,9 +271,11 @@ class OrderManager:
         stop_distance: float,
         stop_price: float,
         take_profit: float,
+        entry_price: float,
+        order_mode: str,
     ) -> None:
         logger.info(
-            f"[{symbol}] Order {signal.setup} {signal.direction} @ {signal.entry_price} "
+            f"[{symbol}] Order {signal.setup} {signal.direction} @{entry_price:.5f} ({order_mode}) "
             f"SL={stop_price:.2f} TP={take_profit:.2f} "
             f"Vol={volume:.3f} (risk={risk_amount:.2f}, stop={stop_distance:.5f},/lot={risk_per_lot:.3f}) -> {result}"
         )
@@ -343,6 +392,8 @@ class OrderManager:
         stop_distance: float,
         stop_price: float,
         take_profit: float,
+        entry_price: float,
+        order_mode: str,
     ) -> None:
         url = self.cfg.webhook_url
         if not url:
@@ -356,9 +407,10 @@ class OrderManager:
             "fields": [
                 {"name": "Setup", "value": signal.setup, "inline": True},
                 {"name": "Volume", "value": f"{volume:.3f} Lots", "inline": True},
-                {"name": "Entry", "value": f"{signal.entry_price:.4f}", "inline": True},
+                {"name": "Entry", "value": f"{entry_price:.4f}", "inline": True},
                 {"name": "Stop", "value": f"{stop_price:.4f}", "inline": True},
                 {"name": "TP", "value": f"{take_profit:.4f}", "inline": True},
+                {"name": "Order-Modus", "value": order_mode, "inline": True},
                 {"name": "Risk", "value": f"{risk_amount:.2f} | per lot {risk_per_lot:.3f}", "inline": True},
                 {"name": "Retcode", "value": result.get("retcode_description", str(result.get("retcode"))), "inline": True},
             ],
@@ -462,9 +514,8 @@ class OrderManager:
         self._recent_returns.append(tp_distance / stop_distance)
 
     def _calculate_volume(
-        self, symbol: str, signal: EntrySignal, info: Optional[Any], stop_price: float
+        self, symbol: str, signal: EntrySignal, info: Optional[Any], stop_price: float, entry_price: float
     ) -> Tuple[float, float, float, float]:
-        entry_price = signal.entry_price
         stop_distance = abs(entry_price - stop_price)
         balance = self._refresh_account_balance()
         base_risk_amount = max(0.0, self.cfg.risk_per_trade * balance)

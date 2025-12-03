@@ -334,6 +334,118 @@ class MetaTrader5Adapter:
             print(f"[MT5] Order fehlgeschlagen: {exc}")
             return {"symbol": symbol, "volume": volume, "direction": direction, "sl": sl, "tp": tp, "status": "fallback"}
 
+    def place_limit_order(
+        self,
+        symbol: str,
+        volume: float,
+        direction: str,
+        price: float,
+        sl: float,
+        tp: float,
+        expiration: Optional[int] = None,
+    ) -> dict:
+        if self._mock:
+            payload = {
+                "symbol": symbol,
+                "volume": volume,
+                "direction": direction,
+                "price": price,
+                "sl": sl,
+                "tp": tp,
+                "status": "mock",
+                "expiration": expiration,
+            }
+            return payload
+        try:
+            self._ensure_symbol_selected(symbol)
+            info = mt5.symbol_info(symbol)
+            if info is None:
+                raise RuntimeError(f"Symbolinfo für {symbol} fehlt")
+            op = mt5.ORDER_TYPE_BUY_LIMIT if direction == "UP" else mt5.ORDER_TYPE_SELL_LIMIT
+            min_distance = self._required_stop_distance(info)
+            sl_candidate = self._adjust_stop(price, sl, direction, min_distance)
+            sl_safe = self._normalize_stop(info, sl_candidate, direction)
+            tp_safe = self._normalize_tp(info, tp, direction)
+            valid_stop, distance, _, reason = self._validate_stop_distance(price, sl_safe, direction, info, min_distance)
+            adjusted = sl_safe != sl
+            if not valid_stop:
+                sl_safe = self._adjust_stop(price, sl_safe, direction, min_distance)
+                sl_safe = self._normalize_stop(info, sl_safe, direction)
+                valid_stop, distance, _, reason = self._validate_stop_distance(price, sl_safe, direction, info, min_distance)
+            if not valid_stop:
+                return {
+                    "symbol": symbol,
+                    "volume": volume,
+                    "direction": direction,
+                    "price": price,
+                    "sl": sl_safe,
+                    "tp": tp_safe,
+                    "status": self._SKIPPED_INVALID_STOP,
+                    "reason": reason,
+                    "required_distance": min_distance,
+                    "actual_distance": distance,
+                    "stop_adjusted": adjusted,
+                    "adjusted_stop": sl_safe,
+                }
+            filling_mode = self._determine_filling(info)
+            request = {
+                "action": mt5.TRADE_ACTION_PENDING,
+                "symbol": symbol,
+                "volume": volume,
+                "type": op,
+                "price": price,
+                "sl": sl_safe,
+                "tp": tp_safe,
+                "deviation": 5,
+                "type_filling": filling_mode,
+            }
+            request["type_time"] = mt5.ORDER_TIME_GTC
+            if expiration is not None:
+                request["type_time"] = mt5.ORDER_TIME_SPECIFIED
+                request["expiration"] = expiration
+            candidates = self._filling_candidates(filling_mode)
+            attempts: list[dict] = []
+            final_payload: Optional[dict] = None
+            for mode in candidates:
+                request["type_filling"] = mode
+                payload = self._send_request(request)
+                payload["retcode_description"] = self.describe_retcode(payload.get("retcode"))
+                payload["stop_adjusted"] = adjusted
+                payload["adjusted_stop"] = sl_safe
+                payload["adjusted_distance"] = distance
+                attempts.append({"mode": mode, "retcode": payload.get("retcode"), "comment": payload.get("comment")})
+                if payload.get("retcode") != self._UNSUPPORTED_FILLING_RETCODE:
+                    payload["filling_mode_used"] = mode
+                    payload["filling_attempts"] = attempts
+                    final_payload = payload
+                    break
+                final_payload = payload
+            if final_payload is None:
+                return {
+                    "symbol": symbol,
+                    "volume": volume,
+                    "direction": direction,
+                    "price": price,
+                    "sl": sl_safe,
+                    "tp": tp_safe,
+                    "status": "fallback",
+                }
+            if "filling_mode_used" not in final_payload:
+                final_payload["filling_mode_used"] = candidates[-1]
+            final_payload.setdefault("filling_attempts", attempts)
+            final_payload["retcode_description"] = self.describe_retcode(final_payload.get("retcode"))
+            return final_payload
+        except Exception as exc:
+            print(f"[MT5] Pending Order fehlgeschlagen: {exc}")
+            return {
+                "symbol": symbol,
+                "volume": volume,
+                "direction": direction,
+                "price": price,
+                "sl": sl,
+                "tp": tp,
+                "status": "fallback",
+            }
     def modify_position_sl_tp(self, ticket: int, symbol: str, sl: Optional[float], tp: Optional[float]) -> dict:
         try:
             request: dict[str, Any] = {

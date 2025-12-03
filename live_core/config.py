@@ -38,6 +38,8 @@ class LiveConfig:
     size_by_prob: bool = False
     prob_size_min: float = 0.7
     prob_size_max: float = 1.5
+    use_pending_orders: bool = True
+    pending_order_expiry_minutes: int = 120
     order_cooldown_seconds: int = 1
     entry_buffer_atr: float = 0.25
     stop_loss_multiplier: float = 1.5

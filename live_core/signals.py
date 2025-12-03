@@ -59,6 +59,8 @@ class EntrySignal:
     tp2: float
     confidence: float
     setup: str
+    entry_zone: Optional[Tuple[float, float]] = None
+    entry_tf: str = "H1"
 
 
 class ElliottEngine:
@@ -378,6 +380,8 @@ class SignalEngine:
             tp2=setup.tp2,
             confidence=confidence,
             setup=setup.name,
+            entry_zone=setup.zone,
+            entry_tf=setup.entry_tf,
         )
 
     def _apply_ml_probability(self, symbol: str, signal: EntrySignal) -> Optional[float]:
