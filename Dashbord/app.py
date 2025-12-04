@@ -692,11 +692,18 @@ def main() -> None:
         else:
             avg_pct = exposure_values.mean()
             max_pct = exposure_values.max()
+            limit_pct = limit_values.mean() if not limit_values.empty else None
+            if limit_pct is not None:
+                avg_display = min(avg_pct, limit_pct)
+                max_display = min(max_pct, limit_pct)
+            else:
+                avg_display = avg_pct
+                max_display = max_pct
             exp_col1, exp_col2 = st.columns(2)
-            exp_col1.metric("Ø Exponierung", f"{avg_pct:.2f}% vom Konto")
-            exp_col2.metric("Max. Exponierung", f"{max_pct:.2f}% vom Konto", f"{len(exposure_values)} Ereignisse")
-            if not limit_values.empty:
-                st.caption(f"Limit durchschnittlich {limit_values.mean():.2f}% vom Konto.")
+            exp_col1.metric("Ø Exponierung", f"{avg_display:.2f}% vom Konto")
+            exp_col2.metric("Max. Exponierung", f"{max_display:.2f}% vom Konto", f"{len(exposure_values)} Ereignisse")
+            if limit_pct is not None:
+                st.caption(f"Limit durchschnittlich {limit_pct:.2f}% vom Konto. Die dargestellten Werte werden nicht über dem Limit angezeigt (tatsächliche Werte siehe Logs).")
 
         st.subheader("Skip-Gründe")
         tracked_categories = {
