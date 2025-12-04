@@ -47,8 +47,9 @@ class LiveConfig:
     min_stop_distance_pct: float = 0.0008
     trade_cooldown_minutes: int = 30
     max_trades_per_symbol_per_hour: int = 2
-    min_profit_factor: float = 1.2
+    min_profit_factor: float = 1.0
     max_gross_exposure_pct: float = 0.01
+    price_guard_margin: float = 0.0
     atr_period: int = 14
     ema_fast: int = 34
     ema_slow: int = 144

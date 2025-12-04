@@ -199,24 +199,25 @@ class OrderManager:
 
     def _price_supports_order(self, symbol: str, direction: Dir, price: float, stop_price: float, take_profit: float) -> bool:
         eps = 1e-6
+        margin = max(0.0, self.cfg.price_guard_margin)
         if direction == Dir.UP:
-            if price <= stop_price + eps:
+            if price <= stop_price - margin + eps:
                 logger.info(
                     f"[{symbol}] Signal {direction} übersprungen: aktueller Preis {price:.5f} <= Stop {stop_price:.5f}"
                 )
                 return False
-            if price >= take_profit - eps:
+            if price >= take_profit + margin - eps:
                 logger.info(
                     f"[{symbol}] Signal {direction} übersprungen: aktueller Preis {price:.5f} >= TP {take_profit:.5f}"
                 )
                 return False
         else:
-            if price >= stop_price - eps:
+            if price >= stop_price + margin - eps:
                 logger.info(
                     f"[{symbol}] Signal {direction} übersprungen: aktueller Preis {price:.5f} >= Stop {stop_price:.5f}"
                 )
                 return False
-            if price <= take_profit + eps:
+            if price <= take_profit - margin + eps:
                 logger.info(
                     f"[{symbol}] Signal {direction} übersprungen: aktueller Preis {price:.5f} <= TP {take_profit:.5f}"
                 )
