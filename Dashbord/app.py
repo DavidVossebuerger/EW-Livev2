@@ -25,8 +25,8 @@ AUTH_DB_PATH = Path(__file__).resolve().parents[1] / "auth.db"
 DEFAULT_ADMIN_EMAIL = "vossebuerger@fmmuc.com"
 DEFAULT_ADMIN_PASSWORD = "mimiKatze1!"
 DEFAULT_ADMIN_TOTP_SECRET = "H3OTZX3E66ETCN4XXMHHFLV4BLDET3D4"
-EMERGENCY_EMAIL = "david.vossebuerger@fmmuc.com"
-EMERGENCY_PASSWORD = "mimiKatze1!"
+EMERGENCY_EMAIL = "guest1@fmmuc.com"
+EMERGENCY_PASSWORD = "guest1"
 EMERGENCY_TOTP_CODE = "000000"
 TIMESTAMP_OFFSET_PATTERN = re.compile(r"([+-]\d{2})(\d{2})$")
 CR_PATTERN = re.compile(r"Chance/Risiko\s+([0-9.,]+)")
@@ -37,6 +37,9 @@ PRICE_GUARD_PATTERN = re.compile(
 )
 STOP_DIST_PATTERN = re.compile(r"Stop-Distanz\s+([0-9.,]+)\s+<\s+Mindestabstand\s+([0-9.,]+)")
 CONFIDENCE_PATTERN = re.compile(r"Confidence\s+([0-9.,]+)\s+<\s+Threshold\s+([0-9.,]+)")
+EXPOSURE_PATTERN = re.compile(
+    r"Exponierung\s+[0-9.,]+\s+>\s+Limit\s+[0-9.,]+\s+\(max\s+([0-9.,]+)%\s+vom\s+Konto,\s+aktuell\s+([0-9.,]+)%\s+vom\s+Konto\)"
+)
 COOLDOWN_PATTERN = re.compile(r"Cooldown aktiv\s+\(([0-9.,]+)m verbleibend\)")
 CYCLE_DURATION_PATTERN = re.compile(r"Dauer=([0-9.,]+)s")
 ENTRY_SIGNAL_PATTERN = re.compile(r"LastEntry=EntrySignal\((?P<payload>[^)]*)\)")
@@ -317,6 +320,8 @@ def _extract_metrics(message: str) -> dict:
         "confidence_gap": None,
         "cooldown_minutes": None,
         "cycle_duration": None,
+        "exposure_pct": None,
+        "exposure_limit_pct": None,
     }
 
     cr_match = CR_PATTERN.search(message)
@@ -361,6 +366,15 @@ def _extract_metrics(message: str) -> dict:
     cycle_match = CYCLE_DURATION_PATTERN.search(message)
     if cycle_match:
         data["cycle_duration"] = _safe_float(cycle_match.group(1))
+
+    exposure_match = EXPOSURE_PATTERN.search(message)
+    if exposure_match:
+        limit_pct = _safe_float(exposure_match.group(1))
+        actual_pct = _safe_float(exposure_match.group(2))
+        if limit_pct is not None:
+            data["exposure_limit_pct"] = limit_pct
+        if actual_pct is not None:
+            data["exposure_pct"] = actual_pct
 
     return data
 
@@ -667,6 +681,22 @@ def main() -> None:
             top_symbol = most_common.idxmax()
             top_symbol_count = int(most_common.max())
         st.metric("Top-Symbol (Skips)", top_symbol, f"{top_symbol_count} Ereignisse")
+
+        exposure_series = filtered["exposure_pct"] if "exposure_pct" in filtered else pd.Series(dtype=float)
+        limit_series = filtered["exposure_limit_pct"] if "exposure_limit_pct" in filtered else pd.Series(dtype=float)
+        exposure_values = exposure_series.dropna()
+        limit_values = limit_series.dropna()
+        st.subheader("Expositionslimits")
+        if exposure_values.empty:
+            st.write("Keine Expositionslimit-Skips vorhanden.")
+        else:
+            avg_pct = exposure_values.mean()
+            max_pct = exposure_values.max()
+            exp_col1, exp_col2 = st.columns(2)
+            exp_col1.metric("Ø Exponierung", f"{avg_pct:.2f}% vom Konto")
+            exp_col2.metric("Max. Exponierung", f"{max_pct:.2f}% vom Konto", f"{len(exposure_values)} Ereignisse")
+            if not limit_values.empty:
+                st.caption(f"Limit durchschnittlich {limit_values.mean():.2f}% vom Konto.")
 
         st.subheader("Skip-Gründe")
         tracked_categories = {

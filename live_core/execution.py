@@ -357,8 +357,9 @@ class OrderManager:
         current = self._current_gross_exposure()
         projected = current + max(0.0, additional_notional)
         if projected > allowed:
+            projected_pct = (projected / balance * 100) if balance > 0 else 0.0
             logger.info(
-                f"[{symbol}] Signal übersprungen: Exponierung {projected:.2f} > Limit {allowed:.2f} (max {limit_pct*100:.2f}% vom Konto)"
+                f"[{symbol}] Signal übersprungen: Exponierung {projected:.2f} > Limit {allowed:.2f} (max {limit_pct*100:.2f}% vom Konto, aktuell {projected_pct:.2f}% vom Konto)"
             )
             return False
         return True
