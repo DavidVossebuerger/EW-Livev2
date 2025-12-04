@@ -53,8 +53,11 @@ class OrderManager:
         if not self.adapter.connected:
             raise RuntimeError("MT5 nicht verbunden")
         existing_positions = self.adapter.get_positions(symbol)
+        placed_this_cycle = False
         limited_signals = signals[: self.cfg.max_open_trades]
         for idx, signal in enumerate(limited_signals):
+            if placed_this_cycle:
+                break
             open_positions = existing_positions if idx == 0 else self.adapter.get_positions(symbol)
             if self.cfg.use_ml_filters:
                 threshold = self.cfg.ml_probability_threshold + self.cfg.ml_threshold_shift
@@ -183,6 +186,7 @@ class OrderManager:
                 should_continue = self._process_execution_result(symbol, signal.direction, result)
                 if result.get("retcode") == self.SUCCESS_RETCODE:
                     self._last_confidence[symbol] = confidence
+                    placed_this_cycle = True
                 if not should_continue:
                     break
             except Exception as exc:
