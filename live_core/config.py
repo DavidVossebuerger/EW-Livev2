@@ -5,7 +5,40 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
+
+AGGRESSIVE_PROFILE_DEFAULTS: Dict[str, Any] = {
+    "atr_period": 14,
+    "atr_mult_buffer": 0.20,
+    "primary_zz_pct": 0.012,
+    "primary_zz_atr_mult": 0.9,
+    "primary_min_imp_atr": 1.8,
+    "h1_zz_pct": 0.0020,
+    "h1_zz_atr_mult": 0.6,
+    "h1_min_imp_atr": 1.6,
+    "entry_zone_w3": (0.382, 0.786),
+    "entry_zone_w5": (0.236, 0.618),
+    "entry_zone_c": (0.382, 0.786),
+    "entry_window_h1": 96,
+    "entry_window_m30": 192,
+    "max_hold_h1": 192,
+    "max_hold_m30": 384,
+    "tp1": 1.272,
+    "tp2": 1.618,
+    "ema_fast": 34,
+    "ema_slow": 144,
+    "use_ema_trend": False,
+    "require_price_above_ema_fast": False,
+    "atr_pct_min": 0.05,
+    "atr_pct_max": 2.5,
+    "confirm_bars_h1": 6,
+    "confirm_bars_m30": 12,
+    "confirm_rules": ("break_prev_extreme", "ema_fast_cross"),
+    "allow_touch_if_no_confirm": True,
+    "use_w5": False,
+    "use_adx": False,
+    "adx_trend_threshold": 25.0,
+}
 
 
 @dataclass
@@ -88,39 +121,6 @@ class LiveConfig:
     use_ema_trend: bool = False
     require_price_above_ema_fast: bool = False
 
-    AGGRESSIVE_PROFILE_DEFAULTS: ClassVar[Dict[str, Any]] = {
-        "atr_period": 14,
-        "atr_mult_buffer": 0.20,
-        "primary_zz_pct": 0.012,
-        "primary_zz_atr_mult": 0.9,
-        "primary_min_imp_atr": 1.8,
-        "h1_zz_pct": 0.0020,
-        "h1_zz_atr_mult": 0.6,
-        "h1_min_imp_atr": 1.6,
-        "entry_zone_w3": (0.382, 0.786),
-        "entry_zone_w5": (0.236, 0.618),
-        "entry_zone_c": (0.382, 0.786),
-        "entry_window_h1": 96,
-        "entry_window_m30": 192,
-        "max_hold_h1": 192,
-        "max_hold_m30": 384,
-        "tp1": 1.272,
-        "tp2": 1.618,
-        "ema_fast": 34,
-        "ema_slow": 144,
-        "use_ema_trend": False,
-        "require_price_above_ema_fast": False,
-        "atr_pct_min": 0.05,
-        "atr_pct_max": 2.5,
-        "confirm_bars_h1": 6,
-        "confirm_bars_m30": 12,
-        "confirm_rules": ("break_prev_extreme", "ema_fast_cross"),
-        "allow_touch_if_no_confirm": True,
-        "use_w5": False,
-        "use_adx": False,
-        "adx_trend_threshold": 25.0,
-    }
-
     def __post_init__(self) -> None:
         if not hasattr(self, "_provided_fields"):
             object.__setattr__(self, "_provided_fields", set())
@@ -187,7 +187,7 @@ class LiveConfig:
 
     def apply_aggressive_profile(self) -> "LiveConfig":
         provided = set(getattr(self, "_provided_fields", set()))
-        filtered = {k: v for k, v in self.AGGRESSIVE_PROFILE_DEFAULTS.items() if k not in provided}
+        filtered = {k: v for k, v in AGGRESSIVE_PROFILE_DEFAULTS.items() if k not in provided}
         if not filtered:
             return self
         return self.with_overrides(filtered, register_overrides_as_provided=False)
