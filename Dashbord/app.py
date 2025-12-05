@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import pyotp
 import qrcode
@@ -467,6 +468,29 @@ def _prepare_entry_signals(df: pd.DataFrame) -> pd.DataFrame:
             ]
         )
     return pd.DataFrame(entries)
+def _segment_file_stats(segment_dir: Path) -> tuple[int, Optional[pd.Timestamp]]:
+    if not segment_dir.exists() or not segment_dir.is_dir():
+        return 0, None
+    files = [p for p in segment_dir.iterdir() if p.is_file()]
+    if not files:
+        return 0, None
+    latest = max(pd.to_datetime(p.stat().st_mtime, unit="s", utc=True) for p in files)
+    return len(files), latest
+
+
+def _format_duration(seconds: Optional[float]) -> str:
+    if seconds is None or (isinstance(seconds, float) and np.isnan(seconds)):
+        return "-"
+    return f"{seconds:.1f}s"
+
+
+def _format_timestamp(ts: Optional[pd.Timestamp]) -> str:
+    if ts is None or pd.isna(ts):
+        return "-"
+    ts = ts.tz_convert("UTC") if ts.tzinfo is not None else ts.tz_localize("UTC")
+    return ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def _timeline_frequency(span: pd.Timedelta) -> str:
     if span <= pd.Timedelta(hours=12):
         return "30min"
@@ -658,14 +682,33 @@ def main() -> None:
         filtered = filtered[filtered["category"].isin(category_filter)]
 
     entry_signals = _prepare_entry_signals(filtered)
-
+    segment_dir = Path(log_path)
+    segment_count, last_segment_ts = _segment_file_stats(segment_dir)
+    cycles = filtered[filtered["category"] == "Cycle"]
+    cycle_durations = cycles["cycle_duration"].dropna()
+    last_cycle_duration = cycle_durations.iloc[-1] if not cycle_durations.empty else None
+    avg_cycle_duration = cycle_durations.mean() if not cycle_durations.empty else None
+    last_cycle_time = (
+        cycles["timestamp"].dropna().max() if not cycles["timestamp"].dropna().empty else None
+    )
+    st.subheader("Pipeline-Status")
+    status_cols = st.columns(4)
+    status_cols[0].metric("Logsegmente", segment_count)
+    status_cols[1].metric("Letzte Logaktualisierung", _format_timestamp(last_segment_ts))
+    status_cols[2].metric("Ø Cycle-Dauer", _format_duration(avg_cycle_duration))
+    status_cols[3].metric("Letzte Cycle-Dauer", _format_duration(last_cycle_duration))
+    if last_segment_ts:
+        delta = pd.Timestamp.now(tz="UTC") - last_segment_ts
+        freshness_label = f"{int(delta.total_seconds() // 60)}m alt"
+        st.caption(f"Logdaten zuletzt aktualisiert vor {freshness_label}.")
+    if last_cycle_time is not None:
+        st.caption(f"Letzter Cycle endet um {_format_timestamp(last_cycle_time)}.")
     if filtered.empty:
         st.warning("Für die aktuellen Filter liegen keine Einträge vor.")
 
     overview_tab, insights_tab, signal_tab, raw_tab = st.tabs(["Übersicht", "Insights", "MT5 Signale", "Rohdaten"])
 
     with overview_tab:
-        cycles = filtered[filtered["category"] == "Cycle"]
         profit_rejects = (filtered["category"] == "Profit-Faktor").sum()
         broker_blocks = (filtered["category"] == "Broker untersagt").sum()
         col1, col2, col3, col4 = st.columns(4)

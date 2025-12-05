@@ -92,6 +92,37 @@ def _bounded_index(raw_idx: Any, max_idx: int) -> int:
     return min(candidate, max_idx)
 
 
+def compute_adx(df: pd.DataFrame, period: int, out_col: str) -> None:
+    if period <= 0 or df.empty:
+        return
+    required = {"high", "low", "close"}
+    if not required.issubset(df.columns):
+        return
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_high = high.shift(1)
+    prev_low = low.shift(1)
+    prev_close = close.shift(1)
+    up = high - prev_high
+    down = prev_low - low
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    plus_di = 100.0 * (
+        pd.Series(plus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / (atr + 1e-12)
+    )
+    minus_di = 100.0 * (
+        pd.Series(minus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / (atr + 1e-12)
+    )
+    dx = 100.0 * ((plus_di - minus_di).abs() / ((plus_di + minus_di).abs() + 1e-12))
+    adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
+    df[out_col] = adx
+
+
 class ElliottEngine:
     def __init__(self, zz_pct: float, zz_atr_mult: float, min_impulse_atr: float):
         self.zz_pct = zz_pct
@@ -256,6 +287,9 @@ def add_indicators(df: pd.DataFrame, cfg: LiveConfig) -> pd.DataFrame:
     df["EMA_SLOW"] = close.ewm(span=cfg.ema_slow, adjust=False).mean()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.sort_values("date").reset_index(drop=True)
+    if cfg.use_adx and cfg.adx_period > 0:
+        adx_col = f"ADX_{cfg.adx_period}"
+        compute_adx(df, cfg.adx_period, adx_col)
     return df
 
 
@@ -308,17 +342,73 @@ def vol_ok(row: pd.Series, cfg: LiveConfig) -> bool:
     return cfg.atr_pct_min <= atr_pct <= cfg.atr_pct_max
 
 
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def ema_trend_ok(row: pd.Series, direction: Dir, cfg: LiveConfig) -> bool:
+    if not cfg.use_ema_trend:
+        return True
+    fast = _to_float(row.get("EMA_FAST"))
+    slow = _to_float(row.get("EMA_SLOW"))
+    if fast is None or slow is None or np.isnan(fast) or np.isnan(slow):
+        return True
+    price = _to_float(row.get("close"))
+    if cfg.require_price_above_ema_fast and price is not None and not np.isnan(price):
+        if direction == Dir.UP:
+            return fast > slow and price > fast
+        return fast < slow and price < fast
+    if direction == Dir.UP:
+        return fast > slow
+    return fast < slow
+
+
 class SignalEngine:
     def __init__(self, cfg: LiveConfig, ml_provider: Optional[MLProbabilityProvider] = None):
         self.cfg = cfg
         self.primary_engine = ElliottEngine(cfg.primary_zz_pct, cfg.primary_zz_atr_mult, cfg.primary_min_imp_atr)
         self.h1_engine = ElliottEngine(cfg.h1_zz_pct, cfg.h1_zz_atr_mult, cfg.h1_min_imp_atr)
         self.ml_provider = ml_provider
+        self._daily_ema_df: Optional[pd.DataFrame] = None
 
     def preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
+            self._daily_ema_df = None
             return df
-        return add_indicators(df, self.cfg)
+        processed = add_indicators(df, self.cfg)
+        self._daily_ema_df = self._build_daily_ema(processed)
+        return processed
+
+    def _build_daily_ema(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if not self.cfg.use_daily_ema or df.empty or "date" not in df.columns:
+            return None
+        daily_close = (
+            df.set_index("date")["close"].resample("1D").last().dropna().to_frame()
+        )
+        if daily_close.empty:
+            return None
+        daily = daily_close.copy()
+        daily["EMA_FAST"] = daily["close"].ewm(span=self.cfg.ema_fast, adjust=False).mean()
+        daily["EMA_SLOW"] = daily["close"].ewm(span=self.cfg.ema_slow, adjust=False).mean()
+        return daily.reset_index()
+
+    def _daily_trend_ok(self, timestamp: pd.Timestamp, direction: Dir) -> bool:
+        if not self.cfg.use_daily_ema or self._daily_ema_df is None:
+            return True
+        mask = self._daily_ema_df["date"] <= pd.to_datetime(timestamp)
+        if not mask.any():
+            return True
+        row = self._daily_ema_df.loc[mask].iloc[-1]
+        fast = _to_float(row.get("EMA_FAST"))
+        slow = _to_float(row.get("EMA_SLOW"))
+        if fast is None or slow is None or np.isnan(fast) or np.isnan(slow):
+            return True
+        if direction == Dir.UP:
+            return fast > slow
+        return fast < slow
 
     def build_signals(self, df: pd.DataFrame, symbol: str) -> List[EntrySignal]:
         if df.empty:
@@ -376,6 +466,20 @@ class SignalEngine:
         if start_idx is None:
             return None
         row = df.iloc[start_idx]
+        if self.cfg.use_adx and self.cfg.adx_period > 0:
+            adx_col = f"ADX_{self.cfg.adx_period}"
+            adx_value = row.get(adx_col)
+            if adx_value is not None:
+                try:
+                    adx_value = float(adx_value)
+                except (TypeError, ValueError):
+                    adx_value = np.nan
+            if adx_value is not None and not np.isnan(adx_value) and adx_value < self.cfg.adx_trend_threshold:
+                return None
+        if not ema_trend_ok(row, setup.direction, self.cfg):
+            return None
+        if not self._daily_trend_ok(setup.start_time, setup.direction):
+            return None
         if not vol_ok(row, self.cfg):
             return None
         if self.cfg.timeframe.upper() == "30M":

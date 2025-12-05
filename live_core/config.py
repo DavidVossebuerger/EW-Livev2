@@ -29,6 +29,7 @@ AGGRESSIVE_PROFILE_DEFAULTS: Dict[str, Any] = {
     "ema_slow": 144,
     "use_ema_trend": False,
     "require_price_above_ema_fast": False,
+    "use_daily_ema": False,
     "atr_pct_min": 0.05,
     "atr_pct_max": 2.5,
     "confirm_bars_h1": 6,
@@ -37,6 +38,7 @@ AGGRESSIVE_PROFILE_DEFAULTS: Dict[str, Any] = {
     "allow_touch_if_no_confirm": True,
     "use_w5": False,
     "use_adx": False,
+    "adx_period": 14,
     "adx_trend_threshold": 25.0,
 }
 
@@ -120,9 +122,11 @@ class LiveConfig:
     allow_touch_if_no_confirm: bool = True
     use_w5: bool = False
     use_adx: bool = False
+    adx_period: int = 14
     adx_trend_threshold: float = 25.0
     use_ema_trend: bool = False
     require_price_above_ema_fast: bool = False
+    use_daily_ema: bool = False
 
     def __post_init__(self) -> None:
         if not hasattr(self, "_provided_fields"):
