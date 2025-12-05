@@ -181,6 +181,76 @@ def _render_totp_qr(secret: str, email: str) -> None:
     st.image(buffer, caption="Diet einen QR-Code in deinen Authenticator", use_column_width=True)
 
 
+def _inject_dashboard_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --card-bg: linear-gradient(135deg, #0c1116, #1a2330);
+            --card-glow: 0 8px 30px rgba(12, 123, 255, 0.35);
+            --text-muted: rgba(255, 255, 255, 0.65);
+        }
+        body {
+            background-color: #03070c;
+        }
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .status-card {
+            padding: 18px 22px;
+            border-radius: 18px;
+            background: var(--card-bg);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            box-shadow: var(--card-glow);
+            animation: pulse 8s ease-in-out infinite;
+        }
+        .status-card strong {
+            display: block;
+            font-size: 1.8rem;
+        }
+        .status-card .context {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+        .insight-panel,
+        .insight-panel.chart-panel {
+            border-radius: 18px;
+            background: linear-gradient(180deg, rgba(8,31,52,0.75), rgba(11,47,81,0.9));
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            padding: 16px;
+            box-shadow: 0 20px 45px rgba(2, 8, 24, 0.7);
+            animation: float 12s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0% { transform: translateY(0); }
+            50% { transform: translateY(-4px); box-shadow: 0 15px 25px rgba(12, 123, 255, 0.45); }
+            100% { transform: translateY(0); }
+        }
+        @keyframes float {
+            0% { transform: translateY(0); }
+            50% { transform: translateY(-6px); }
+            100% { transform: translateY(0); }
+        }
+        .chart-panel {
+            padding: 0 !important;
+        }
+        .chart-panel .stMarkdown {
+            margin-bottom: 0;
+        }
+        @media (max-width: 768px) {
+            .status-card strong {
+                font-size: 1.4rem;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _rerun_app() -> None:
     rerun_func = getattr(st, "experimental_rerun", None) or getattr(st, "rerun", None)
     if rerun_func:
@@ -491,6 +561,20 @@ def _format_timestamp(ts: Optional[pd.Timestamp]) -> str:
     return ts.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _render_status_cards(cards: List[Tuple[str, str, str]]) -> None:
+    card_html = "".join(
+        f"""
+        <div class=\"status-card\">
+            <span class=\"context\">{title}</span>
+            <strong>{value}</strong>
+            <span class=\"context\">{subtitle}</span>
+        </div>
+        """
+        for title, value, subtitle in cards
+    )
+    st.markdown(f"<div class=\"status-grid\">{card_html}</div>", unsafe_allow_html=True)
+
+
 def _timeline_frequency(span: pd.Timedelta) -> str:
     if span <= pd.Timedelta(hours=12):
         return "30min"
@@ -598,6 +682,7 @@ def main() -> None:
         _rerun_app()
 
     st.title("EW Live – Monitoring Dashboard")
+    _inject_dashboard_styles()
     st.markdown(
         """
 > **Haftungsausschluss**  
@@ -691,15 +776,19 @@ def main() -> None:
     last_cycle_time = (
         cycles["timestamp"].dropna().max() if not cycles["timestamp"].dropna().empty else None
     )
-    st.subheader("Pipeline-Status")
-    status_cols = st.columns(4)
-    status_cols[0].metric("Logsegmente", segment_count)
-    status_cols[1].metric("Letzte Logaktualisierung", _format_timestamp(last_segment_ts))
-    status_cols[2].metric("Ø Cycle-Dauer", _format_duration(avg_cycle_duration))
-    status_cols[3].metric("Letzte Cycle-Dauer", _format_duration(last_cycle_duration))
+    freshness_label = "unbekannt"
     if last_segment_ts:
         delta = pd.Timestamp.now(tz="UTC") - last_segment_ts
         freshness_label = f"{int(delta.total_seconds() // 60)}m alt"
+    st.subheader("Pipeline-Status")
+    status_cards = [
+        ("Logsegmente", str(segment_count), "verfügbar"),
+        ("Letzte Logaktualisierung", _format_timestamp(last_segment_ts), freshness_label),
+        ("Ø Cycle-Dauer", _format_duration(avg_cycle_duration), "berechnet"),
+        ("Letzte Cycle-Dauer", _format_duration(last_cycle_duration), "beendet"),
+    ]
+    _render_status_cards(status_cards)
+    if last_segment_ts:
         st.caption(f"Logdaten zuletzt aktualisiert vor {freshness_label}.")
     if last_cycle_time is not None:
         st.caption(f"Letzter Cycle endet um {_format_timestamp(last_cycle_time)}.")
@@ -818,7 +907,7 @@ def main() -> None:
                     )
                     .properties(height=320)
                 )
-                st.markdown('<div class="animated-panel chart-panel">', unsafe_allow_html=True)
+                st.markdown('<div class="insight-panel chart-panel">', unsafe_allow_html=True)
                 st.altair_chart(chart, use_container_width=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -842,7 +931,7 @@ def main() -> None:
                 )
                 .properties(height=260)
             )
-            st.markdown('<div class="animated-panel chart-panel">', unsafe_allow_html=True)
+            st.markdown('<div class="insight-panel chart-panel">', unsafe_allow_html=True)
             st.altair_chart(hourly_chart, use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -865,7 +954,7 @@ def main() -> None:
                 )
                 .properties(height=320)
             )
-            st.markdown('<div class="animated-panel chart-panel">', unsafe_allow_html=True)
+            st.markdown('<div class="insight-panel chart-panel">', unsafe_allow_html=True)
             st.altair_chart(cat_chart, use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1031,7 +1120,7 @@ def main() -> None:
                     .properties(height=360)
                     .interactive()
                 )
-                st.markdown('<div class="animated-panel chart-panel">', unsafe_allow_html=True)
+                st.markdown('<div class="insight-panel chart-panel">', unsafe_allow_html=True)
                 st.altair_chart(signal_chart, use_container_width=True)
                 st.markdown('</div>', unsafe_allow_html=True)
                 metric_cols = st.columns(3)
