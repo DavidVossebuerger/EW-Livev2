@@ -166,7 +166,7 @@ def _ensure_emergency_account() -> None:
     _ensure_auth_table()
     if _get_user(EMERGENCY_EMAIL):
         return
-    _create_user(EMERGENCY_EMAIL, EMERGENCY_PASSWORD, is_admin=True)
+    _create_user(EMERGENCY_EMAIL, EMERGENCY_PASSWORD, is_admin=False)
 
 
 def _verify_credentials(email: str, password: str, totp_code: str) -> tuple[bool, str, Optional[sqlite3.Row]]:
