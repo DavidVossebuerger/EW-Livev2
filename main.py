@@ -20,6 +20,7 @@ from live_core.signals import SignalEngine
 
 logger = logging.getLogger("ew_live")
 DEFAULT_REMOTE_SEGMENTS = Path(r"C:\Users\Administrator\Documents\EW-Livev2.1\logs\segments")
+LOCAL_RESULTS_SEGMENTS = Path.cwd() / "Ergebnisse" / "segments"
 
 
 class SegmentBufferHandler(logging.Handler):
@@ -251,9 +252,8 @@ def _resolve_segment_dir(log_path: Path, override: Optional[str]) -> Path:
         DEFAULT_REMOTE_SEGMENTS.mkdir(parents=True, exist_ok=True)
         return DEFAULT_REMOTE_SEGMENTS
     except (OSError, PermissionError):
-        fallback = log_path.parent / "segments"
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
+        LOCAL_RESULTS_SEGMENTS.mkdir(parents=True, exist_ok=True)
+        return LOCAL_RESULTS_SEGMENTS
 
 
 if __name__ == "__main__":

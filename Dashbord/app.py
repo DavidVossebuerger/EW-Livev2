@@ -22,6 +22,7 @@ st.set_page_config(page_title="EW Live Dashboard", layout="wide")
 DEFAULT_LOG = Path(__file__).resolve().parents[1] / "logs" / "live_execution.txt"
 REMOTE_SEGMENT_DIR = Path(r"C:\Users\Administrator\Documents\EW-Livev2.1\logs\segments")
 LOCAL_SEGMENT_DIR = Path(__file__).resolve().parents[1] / "logs" / "segments"
+RESULTS_SEGMENT_DIR = Path(__file__).resolve().parents[1] / "Ergebnisse" / "segments"
 AUTH_DB_PATH = Path(__file__).resolve().parents[1] / "auth.db"
 DEFAULT_ADMIN_EMAIL = "vossebuerger@fmmuc.com"
 DEFAULT_ADMIN_PASSWORD = "mimiKatze1!"
@@ -72,12 +73,13 @@ DEPARTMENTS = [
 ]
 
 def _default_segment_dir() -> Path:
-    try:
-        REMOTE_SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
-        return REMOTE_SEGMENT_DIR
-    except (OSError, PermissionError):
-        LOCAL_SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
-        return LOCAL_SEGMENT_DIR
+    for candidate in (REMOTE_SEGMENT_DIR, LOCAL_SEGMENT_DIR, RESULTS_SEGMENT_DIR):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except (OSError, PermissionError):
+            continue
+    raise FileNotFoundError("Keine Logsegment-Quelle verfügbar")
 
 
 def _get_auth_connection() -> sqlite3.Connection:
