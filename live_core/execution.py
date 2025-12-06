@@ -9,6 +9,7 @@ import ssl
 import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from statistics import pstdev, StatisticsError
 from typing import Any, Dict, Deque, List, Optional, Tuple
 from urllib.error import HTTPError
@@ -44,10 +45,14 @@ class OrderManager:
         self._last_trade_time: Dict[str, datetime] = {}
         self._webhook_fingerprint = self._compute_webhook_fingerprint(cfg.webhook_url)
         self._account_leverage: float = cfg.exposure_default_leverage
+        self._execution_history: list[dict] = self._load_execution_history()
         if self._webhook_fingerprint:
             logger.info(f"Webhook aktiviert (Fingerprint={self._webhook_fingerprint})")
 
     def evaluate_signals(self, symbol: str, signals: List[EntrySignal]) -> None:
+        if not signals:
+            return
+        signals = [s for s in signals if not self._already_executed(s)]
         if not signals:
             return
         if not self.adapter.connected:
@@ -187,6 +192,9 @@ class OrderManager:
                 self._record_expected_return(execution_price, stop_price, take_profit)
                 should_continue = self._process_execution_result(symbol, signal.direction, result)
                 if result.get("retcode") == self.SUCCESS_RETCODE:
+                    self._last_confidence[symbol] = confidence
+                if result.get("retcode") == self.SUCCESS_RETCODE:
+                    self._record_execution(signal)
                     self._last_confidence[symbol] = confidence
                 if not should_continue:
                     break
@@ -351,6 +359,48 @@ class OrderManager:
             logger.info(f"[{symbol}] Filling-Mode {used} verwendet (Versuche: {summary})")
         else:
             logger.info(f"[{symbol}] Filling-Versuche: {summary}")
+
+    def _resolve_store_path(self) -> Path:
+        order_store_path = self.cfg.order_store_path
+        if not order_store_path:
+            raise RuntimeError("order_store_path is not configured, but execution history is required")
+        path = Path(order_store_path)
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _load_execution_history(self) -> list[dict]:
+        path = self._resolve_store_path()
+        if not path.exists():
+            return []
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except json.JSONDecodeError:
+            logger.warning("Unerwartetes Format in order store, beginne mit leerer Historie")
+            return []
+
+    def _save_execution_history(self) -> None:
+        path = self._resolve_store_path()
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(self._execution_history, fh, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _signal_key(signal: EntrySignal) -> str:
+        return f"{signal.symbol}:{signal.entry_direction}"
+
+    def _already_executed(self, signal: EntrySignal) -> bool:
+        key = self._signal_key(signal)
+        return any(entry.get("key") == key for entry in self._execution_history)
+
+    def _record_execution(self, signal: EntrySignal) -> None:
+        self._execution_history.append({
+            "key": self._signal_key(signal),
+            "symbol": signal.symbol,
+            "direction": signal.entry_direction,
+            "timestamp": signal.timestamp.isoformat()
+        })
+        self._save_execution_history()
 
     def _log_skipped(self, symbol: str, reason: str, required: Optional[float], actual: Optional[float]) -> None:
         parts = [reason]

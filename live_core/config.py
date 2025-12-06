@@ -40,6 +40,7 @@ AGGRESSIVE_PROFILE_DEFAULTS: Dict[str, Any] = {
     "use_adx": False,
     "adx_period": 14,
     "adx_trend_threshold": 25.0,
+    "order_store_path": "logs/placed_orders.json",
 }
 
 
@@ -127,6 +128,7 @@ class LiveConfig:
     use_ema_trend: bool = False
     require_price_above_ema_fast: bool = False
     use_daily_ema: bool = False
+    order_store_path: Optional[str] = "logs/placed_orders.json"
 
     def __post_init__(self) -> None:
         if not hasattr(self, "_provided_fields"):
