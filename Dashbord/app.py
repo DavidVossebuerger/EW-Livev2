@@ -7,7 +7,7 @@ import secrets
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import altair as alt
 import numpy as np
@@ -47,6 +47,10 @@ ENTRY_SIGNAL_PATTERN = re.compile(r"LastEntry=EntrySignal\((?P<payload>[^)]*)\)"
 ENTRY_TIME_PATTERN = re.compile(r"entry_time=Timestamp\('(?P<entry_time>[^']+)'\)")
 ENTRY_DIRECTION_PATTERN = re.compile(r"direction=<Dir\.\w+:\s*'(?P<direction>[A-Z]+)'\>")
 ENTRY_ZONE_PATTERN = re.compile(r"entry_zone=\((?P<low>[0-9.,+-]+),\s*(?P<high>[0-9.,+-]+)\)")
+CYCLE_STATS_PATTERN = re.compile(
+    r"Signals=(?P<signals>\d+).*?Validated=(?P<validated>\d+).*?Executed=(?P<executed>\d+).*?Duplicates=(?P<duplicates>\d+)",
+    re.IGNORECASE,
+)
 
 ALLOWED_EMAIL_DOMAIN = "@fmmuc.com"
 MAX_LOGIN_ATTEMPTS = 5
@@ -200,12 +204,14 @@ def _inject_dashboard_styles() -> None:
         """
         <style>
         :root {
-            --card-bg: linear-gradient(135deg, #0c1116, #1a2330);
-            --card-glow: 0 10px 40px rgba(12, 123, 255, 0.35);
-            --text-muted: rgba(255, 255, 255, 0.65);
+            --card-bg: linear-gradient(135deg, #050913, #101a32);
+            --card-border: rgba(255, 255, 255, 0.12);
+            --text-muted: rgba(255, 255, 255, 0.6);
+            --accent: #7ee1ff;
+            --accent-strong: #4c7dff;
         }
         body {
-            background-color: #03070c;
+            background-color: #01040b;
         }
         .user-chip {
             display: inline-flex;
@@ -214,52 +220,113 @@ def _inject_dashboard_styles() -> None:
             padding: 0.35rem 1rem;
             border-radius: 999px;
             border: 1px solid rgba(255, 255, 255, 0.18);
-            background: rgba(255, 255, 255, 0.03);
+            background: rgba(255, 255, 255, 0.04);
             font-size: 0.95rem;
             margin-bottom: 0.75rem;
         }
         .user-chip strong {
-            color: #78dbff;
+            color: var(--accent);
         }
-        .pipeline-hero {
-            background: linear-gradient(140deg, rgba(8, 11, 26, 0.95), rgba(18, 32, 64, 0.9));
+        .fmmuc-hero {
+            background: linear-gradient(145deg, rgba(5, 9, 20, 0.95), rgba(15, 27, 54, 0.95));
+            border-radius: 32px;
+            padding: clamp(1.75rem, 2vw, 2.5rem);
+            border: 1px solid var(--card-border);
+            box-shadow: 0 30px 70px rgba(0, 4, 15, 0.85);
+            overflow: hidden;
+            position: relative;
+        }
+        .fmmuc-hero::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle, rgba(126, 225, 255, 0.15), transparent 55%);
+            mix-blend-mode: screen;
+            opacity: 0.8;
+            z-index: 0;
+            pointer-events: none;
+        }
+        .fmmuc-hero > * {
+            position: relative;
+            z-index: 1;
+        }
+        .fmmuc-hero .hero-kicker {
+            text-transform: uppercase;
+            letter-spacing: 0.35em;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin: 0;
+        }
+        .fmmuc-hero .hero-title {
+            margin: 0.6rem 0 0.4rem;
+            font-size: clamp(2.2rem, 3vw, 2.8rem);
+            line-height: 1.2;
+        }
+        .fmmuc-hero .hero-description {
+            margin: 0;
+            color: var(--text-muted);
+            line-height: 1.6;
+            max-width: 640px;
+        }
+        .hero-metrics {
+            margin-top: 1.5rem;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 0.8rem;
+        }
+        .hero-metric-card {
+            padding: 1rem 1.2rem;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.02);
             border: 1px solid rgba(255, 255, 255, 0.08);
-            border-radius: 24px;
-            padding: 32px;
-            color: #f7f9fc;
-            box-shadow: 0 25px 60px rgba(2, 8, 24, 0.7);
-            min-height: 220px;
+            font-size: 0.95rem;
+            color: #fff;
         }
-        .pipeline-hero .pipeline-label {
+        .hero-metric-card .subtle {
+            color: var(--text-muted);
+            font-size: 0.7rem;
             text-transform: uppercase;
             letter-spacing: 0.3em;
+        }
+        .hero-metric-card .context {
+            color: var(--text-muted);
             font-size: 0.75rem;
-            color: rgba(255, 255, 255, 0.6);
         }
-        .pipeline-hero .pipeline-count {
-            font-size: 3.4rem;
-            margin: 12px 0 6px;
-            color: #78dbff;
+        .hero-metric-card strong {
             display: block;
+            font-size: 1.6rem;
+            color: var(--accent);
         }
-        .pipeline-hero .pipeline-subtitle {
-            font-size: 1rem;
-            color: rgba(255, 255, 255, 0.75);
-            margin-bottom: 18px;
+        .hero-metric-card .subtle {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
         }
-        .pipeline-hero .pipeline-meta {
+        .insight-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 12px;
-            font-size: 0.9rem;
+            gap: 0.75rem;
+            margin-top: 1.2rem;
         }
-        .pipeline-hero .pipeline-meta span {
-            font-size: 0.8rem;
-            color: rgba(255, 255, 255, 0.55);
+        .insight-card {
+            padding: 0.85rem 1rem;
+            border-radius: 12px;
+            background: rgba(17, 22, 40, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            color: #fff;
+            font-size: 0.85rem;
         }
-        .pipeline-hero .pipeline-meta strong {
-            color: #ffffff;
-            font-size: 1rem;
+        .insight-card .context {
+            color: var(--text-muted);
+            font-size: 0.7rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+        }
+        .insight-card strong {
+            display: block;
+            font-size: 1.25rem;
+            color: var(--accent-strong);
         }
         .status-grid {
             display: grid;
@@ -272,7 +339,7 @@ def _inject_dashboard_styles() -> None:
             border-radius: 18px;
             background: var(--card-bg);
             border: 1px solid rgba(255, 255, 255, 0.06);
-            box-shadow: var(--card-glow);
+            box-shadow: 0 25px 45px rgba(0, 0, 0, 0.5);
             animation: pulse 8s ease-in-out infinite;
             min-height: 130px;
             display: flex;
@@ -313,12 +380,9 @@ def _inject_dashboard_styles() -> None:
             margin-bottom: 0;
         }
         @media (max-width: 768px) {
-            .pipeline-hero {
+            .fmmuc-hero {
                 padding: 24px;
-                min-height: auto;
             }
-        }
-        @media (max-width: 768px) {
             .status-card strong {
                 font-size: 1.4rem;
             }
@@ -472,6 +536,10 @@ def _extract_metrics(message: str) -> dict:
         "exposure_pct": None,
         "exposure_limit_pct": None,
         "exposure_basis": None,
+        "cycle_signals": None,
+        "cycle_validated": None,
+        "cycle_executed": None,
+        "cycle_duplicates": None,
     }
 
     cr_match = CR_PATTERN.search(message)
@@ -516,6 +584,13 @@ def _extract_metrics(message: str) -> dict:
     cycle_match = CYCLE_DURATION_PATTERN.search(message)
     if cycle_match:
         data["cycle_duration"] = _safe_float(cycle_match.group(1))
+
+    stats_match = CYCLE_STATS_PATTERN.search(message)
+    if stats_match:
+        data["cycle_signals"] = _safe_int(stats_match.group("signals"))
+        data["cycle_validated"] = _safe_int(stats_match.group("validated"))
+        data["cycle_executed"] = _safe_int(stats_match.group("executed"))
+        data["cycle_duplicates"] = _safe_int(stats_match.group("duplicates"))
 
     exposure_match = EXPOSURE_PATTERN.search(message)
     if exposure_match:
@@ -632,6 +707,30 @@ def _format_duration(seconds: Optional[float]) -> str:
     return f"{seconds:.1f}s"
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_numeric_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_insight_value(value: Optional[float], precision: int = 2, suffix: str = "") -> str:
+    if value is None:
+        return "-"
+    return f"{value:.{precision}f}{suffix}"
+
+
 def _format_timestamp(ts: Optional[pd.Timestamp]) -> str:
     if ts is None or pd.isna(ts):
         return "-"
@@ -667,30 +766,105 @@ def _render_user_context() -> None:
     )
 
 
+def _cycle_snapshot(cycles: pd.DataFrame) -> dict[str, Any]:
+    defaults = {
+        "cycle_duration": None,
+        "cycle_signals": 0,
+        "cycle_validated": 0,
+        "cycle_executed": 0,
+        "cycle_duplicates": 0,
+    }
+    if cycles.empty:
+        return defaults
+    latest = cycles.sort_values("timestamp").iloc[-1]
+    return {
+        "cycle_duration": _safe_numeric_float(latest.get("duration_seconds")),
+        "cycle_signals": _safe_int(latest.get("cycle_signals")),
+        "cycle_validated": _safe_int(latest.get("cycle_validated")),
+        "cycle_executed": _safe_int(latest.get("cycle_executed")),
+        "cycle_duplicates": _safe_int(latest.get("cycle_duplicates")),
+    }
+
+
+def _insight_metrics(filtered: pd.DataFrame) -> dict[str, Any]:
+    insights: dict[str, Any] = {}
+    confidence_gap = filtered.get("confidence_gap")
+    price_gap = filtered.get("price_gap")
+    exposure = filtered.get("exposure_pct")
+    insights["confidence_gap"] = (
+        float(confidence_gap.dropna().mean()) if isinstance(confidence_gap, pd.Series) and not confidence_gap.dropna().empty else None
+    )
+    insights["price_gap"] = (
+        float(price_gap.dropna().mean()) if isinstance(price_gap, pd.Series) and not price_gap.dropna().empty else None
+    )
+    insights["exposure_pct"] = (
+        float(exposure.dropna().max()) if isinstance(exposure, pd.Series) and not exposure.dropna().empty else None
+    )
+    insights["active_symbols"] = int(filtered["symbol"].nunique()) if not filtered.empty else 0
+    return insights
+
+
 def _render_pipeline_hero(
     segment_count: int,
     last_segment_ts: Optional[pd.Timestamp],
     freshness_label: str,
     last_cycle_time: Optional[pd.Timestamp],
+    stats_snapshot: dict[str, Any],
+    insights: dict[str, Any],
 ) -> None:
     last_update_label = _format_timestamp(last_segment_ts)
     cycle_label = _format_timestamp(last_cycle_time)
+    duration_label = _format_duration(stats_snapshot.get("cycle_duration"))
+    signals = stats_snapshot.get("cycle_signals", 0)
+    validated = stats_snapshot.get("cycle_validated", 0)
+    executed = stats_snapshot.get("cycle_executed", 0)
+    duplicates = stats_snapshot.get("cycle_duplicates", 0)
+    insight_cards = f"""
+        <div class=\"insight-card\">
+            <span class=\"context\">Avg. Confidence Gap</span>
+            <strong>{_format_insight_value(insights.get('confidence_gap'))}</strong>
+            <span class=\"context\">Signalqualität</span>
+        </div>
+        <div class=\"insight-card\">
+            <span class=\"context\">Avg. Price Gap</span>
+            <strong>{_format_insight_value(insights.get('price_gap'))}</strong>
+            <span class=\"context\">Marktversatz</span>
+        </div>
+        <div class=\"insight-card\">
+            <span class=\"context\">Max. Exponierung</span>
+            <strong>{_format_insight_value(insights.get('exposure_pct'), precision=1, suffix='%')}</strong>
+            <span class=\"context\">Kontolimit</span>
+        </div>
+        <div class=\"insight-card\">
+            <span class=\"context\">Aktive Symbole</span>
+            <strong>{int(insights.get('active_symbols') or 0)}</strong>
+            <span class=\"context\">Abgedeckte Märkte</span>
+        </div>
+        """
     st.markdown(
         f"""
-        <div class=\"pipeline-hero\">
-            <span class=\"pipeline-label\">Logsegmente</span>
-            <strong class=\"pipeline-count\">{segment_count}</strong>
-            <p class=\"pipeline-subtitle\">Aktualisiert vor {freshness_label}</p>
-            <div class=\"pipeline-meta\">
-                <div>
-                    <span>Letzte Aktualisierung</span>
-                    <strong>{last_update_label}</strong>
+        <div class=\"fmmuc-hero\">
+            <p class=\"hero-kicker\">Live-Execution Monitoring</p>
+            <h2 class=\"hero-title\">Transparente Ausführung & Signalqualität</h2>
+            <p class=\"hero-description\">Logsegmente, Cycle-Zyklen und aktuelle Metriken zeigen, ob der Live-Betrieb sauber am Backtest dranbleibt.</p>
+            <div class=\"hero-metrics\">
+                <div class=\"hero-metric-card\">
+                    <span class=\"subtle\">Logsegmente</span>
+                    <strong>{segment_count}</strong>
+                    <span class=\"context\">Aktualisiert vor {freshness_label}</span>
                 </div>
-                <div>
-                    <span>Letzter Cycle-Ende</span>
-                    <strong>{cycle_label}</strong>
+                <div class=\"hero-metric-card\">
+                    <span class=\"subtle\">Letzter Cycle</span>
+                    <strong>{duration_label}</strong>
+                    <span class=\"context\">Endet um {cycle_label}</span>
+                </div>
+                <div class=\"hero-metric-card\">
+                    <span class=\"subtle\">Cycle-Signale</span>
+                    <strong>{signals}</strong>
+                    <span class=\"context\">V:{validated} · E:{executed} · D:{duplicates}</span>
                 </div>
             </div>
+            <div class=\"insight-grid\">{insight_cards}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -957,6 +1131,8 @@ def main() -> None:
     last_cycle_time = (
         cycles["timestamp"].dropna().max() if not cycles["timestamp"].dropna().empty else None
     )
+    cycles_snapshot = _cycle_snapshot(cycles)
+    insight_metrics = _insight_metrics(filtered)
     freshness_label = "unbekannt"
     if last_segment_ts:
         delta = pd.Timestamp.now(tz="UTC") - last_segment_ts
@@ -964,7 +1140,14 @@ def main() -> None:
     st.subheader("Pipeline-Status")
     pipeline_col, status_col = st.columns([2, 1], gap="large")
     with pipeline_col:
-        _render_pipeline_hero(segment_count, last_segment_ts, freshness_label, last_cycle_time)
+        _render_pipeline_hero(
+            segment_count,
+            last_segment_ts,
+            freshness_label,
+            last_cycle_time,
+            cycles_snapshot,
+            insight_metrics,
+        )
     status_cards = [
         ("Letzte Logaktualisierung", _format_timestamp(last_segment_ts), freshness_label),
         ("Ø Cycle-Dauer", _format_duration(avg_cycle_duration), "berechnet"),

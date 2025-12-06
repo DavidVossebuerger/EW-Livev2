@@ -147,6 +147,16 @@ def main() -> None:
     env_overrides = LiveConfig.env_overrides()
     cfg = base_config.with_overrides(env_overrides, provided_keys=set(env_overrides.keys()))
     cfg = cfg.apply_aggressive_profile()
+    logger.info(
+        "LiveConfig aktiv: symbol=%s timeframe=%s risk_per_trade=%.3f dynamic_dd_risk=%s use_ml_filters=%s size_short_factor=%.2f use_vol_target=%s",
+        cfg.symbol,
+        cfg.timeframe,
+        cfg.risk_per_trade,
+        cfg.dynamic_dd_risk,
+        cfg.use_ml_filters,
+        cfg.size_short_factor,
+        cfg.use_vol_target,
+    )
     symbols_file = args.symbols_file or cfg.symbols_file
     cfg.symbols_file = symbols_file
     log_path = Path(args.log_file)
@@ -195,8 +205,11 @@ def main() -> None:
             summary = runner.run_cycle(symbols, args.dry_run)
             log_live(
                 "cycle",
-                f"Cycle #{summary.index} abgeschlossen (Symbole={summary.symbols_processed}, "
-                f"Signale={summary.total_signals}, Dauer={summary.duration_seconds:.2f}s)",
+                (
+                    f"Cycle #{summary.index} summary: Symbols={summary.symbols_processed} Signals={summary.total_signals} "
+                    f"Validated={summary.validated_signals} Executed={summary.executed_trades} "
+                    f"Duplicates={summary.duplicate_signals} Dauer={summary.duration_seconds:.2f}s DryRun={summary.dry_run}"
+                ),
             )
             if segment_writer:
                 rotated_path = segment_writer.maybe_flush(summary.index)

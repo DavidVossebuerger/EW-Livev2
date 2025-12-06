@@ -8,7 +8,7 @@ from typing import Callable, Iterable, Sequence
 import pandas as pd
 
 from .config import LiveConfig
-from .execution import OrderManager
+from .execution import ExecutionCycleStats, OrderManager
 from .mt5_adapter import MetaTrader5Adapter
 from .signals import SignalEngine
 
@@ -20,6 +20,9 @@ class CycleSummary:
     duration_seconds: float
     symbols_processed: int
     total_signals: int
+    validated_signals: int
+    duplicate_signals: int
+    executed_trades: int
     dry_run: bool
 
 
@@ -54,6 +57,9 @@ class CycleRunner:
         self.cycle_index += 1
         start_time = datetime.now(timezone.utc)
         total_signals = 0
+        validated = 0
+        duplicates = 0
+        executed = 0
         symbols_list = list(symbols)
         for symbol in symbols_list:
             self.cfg.symbol = symbol
@@ -64,8 +70,10 @@ class CycleRunner:
             total_signals += len(signals)
             last_signal = signals[-1] if signals else "none"
             self.logger(symbol, f"Signals={len(signals)} LastEntry={last_signal}")
-            if not dry_run:
-                self.manager.evaluate_signals(symbol, signals)
+            stats = self.manager.evaluate_signals(symbol, signals) if not dry_run else ExecutionCycleStats()
+            validated += stats.validated_signals
+            duplicates += stats.duplicate_signals
+            executed += stats.executed_trades
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
         return CycleSummary(
             index=self.cycle_index,
@@ -73,5 +81,8 @@ class CycleRunner:
             duration_seconds=duration,
             symbols_processed=len(symbols_list),
             total_signals=total_signals,
+            validated_signals=validated,
+            duplicate_signals=duplicates,
+            executed_trades=executed,
             dry_run=dry_run,
         )

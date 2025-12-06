@@ -8,6 +8,7 @@ import math
 import ssl
 import urllib.request
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from statistics import pstdev, StatisticsError
@@ -21,6 +22,14 @@ from .mt5_adapter import MetaTrader5Adapter
 from .signals import Dir, EntrySignal
 
 logger = logging.getLogger("ew_live")
+
+
+@dataclass
+class ExecutionCycleStats:
+    signals_received: int = 0
+    validated_signals: int = 0
+    duplicate_signals: int = 0
+    executed_trades: int = 0
 
 
 class OrderManager:
@@ -49,23 +58,25 @@ class OrderManager:
         if self._webhook_fingerprint:
             logger.info(f"Webhook aktiviert (Fingerprint={self._webhook_fingerprint})")
 
-    def evaluate_signals(self, symbol: str, signals: List[EntrySignal]) -> None:
+    def evaluate_signals(self, symbol: str, signals: List[EntrySignal]) -> ExecutionCycleStats:
+        stats = ExecutionCycleStats(signals_received=len(signals))
         if not signals:
-            return
-        filtered: List[EntrySignal] = []
+            return stats
+        candidates: List[EntrySignal] = []
         for signal in signals:
             if not self._signal_passes_validation(signal):
                 continue
+            stats.validated_signals += 1
             if self._already_executed(symbol, signal):
+                stats.duplicate_signals += 1
                 continue
-            filtered.append(signal)
-        signals = filtered
-        if not signals:
-            return
+            candidates.append(signal)
+        if not candidates:
+            return stats
         if not self.adapter.connected:
             raise RuntimeError("MT5 nicht verbunden")
         existing_positions = self.adapter.get_positions(symbol)
-        limited_signals = signals[: self.cfg.max_open_trades]
+        limited_signals = candidates[: self.cfg.max_open_trades]
         for idx, signal in enumerate(limited_signals):
             open_positions = existing_positions if idx == 0 else self.adapter.get_positions(symbol)
             if self.cfg.use_ml_filters:
@@ -202,6 +213,7 @@ class OrderManager:
                     self._last_confidence[symbol] = confidence
                 if result.get("retcode") == self.SUCCESS_RETCODE:
                     self._record_execution(symbol, signal)
+                    stats.executed_trades += 1
                     self._last_confidence[symbol] = confidence
                 if not should_continue:
                     break
