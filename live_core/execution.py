@@ -52,7 +52,7 @@ class OrderManager:
     def evaluate_signals(self, symbol: str, signals: List[EntrySignal]) -> None:
         if not signals:
             return
-        signals = [s for s in signals if not self._already_executed(s)]
+        signals = [s for s in signals if not self._already_executed(symbol, s)]
         if not signals:
             return
         if not self.adapter.connected:
@@ -194,7 +194,7 @@ class OrderManager:
                 if result.get("retcode") == self.SUCCESS_RETCODE:
                     self._last_confidence[symbol] = confidence
                 if result.get("retcode") == self.SUCCESS_RETCODE:
-                    self._record_execution(signal)
+                    self._record_execution(symbol, signal)
                     self._last_confidence[symbol] = confidence
                 if not should_continue:
                     break
@@ -386,19 +386,19 @@ class OrderManager:
             json.dump(self._execution_history, fh, ensure_ascii=False, indent=2)
 
     @staticmethod
-    def _signal_key(signal: EntrySignal) -> str:
-        return f"{signal.symbol}:{signal.entry_direction}"
+    def _signal_key(symbol: str, signal: EntrySignal) -> str:
+        return f"{symbol}:{signal.direction}"
 
-    def _already_executed(self, signal: EntrySignal) -> bool:
-        key = self._signal_key(signal)
+    def _already_executed(self, symbol: str, signal: EntrySignal) -> bool:
+        key = self._signal_key(symbol, signal)
         return any(entry.get("key") == key for entry in self._execution_history)
 
-    def _record_execution(self, signal: EntrySignal) -> None:
+    def _record_execution(self, symbol: str, signal: EntrySignal) -> None:
         self._execution_history.append({
-            "key": self._signal_key(signal),
-            "symbol": signal.symbol,
-            "direction": signal.entry_direction,
-            "timestamp": signal.timestamp.isoformat()
+            "key": self._signal_key(symbol, signal),
+            "symbol": symbol,
+            "direction": signal.direction,
+            "timestamp": signal.entry_time.isoformat()
         })
         self._save_execution_history()
 
