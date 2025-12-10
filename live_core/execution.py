@@ -59,6 +59,7 @@ class OrderManager:
         self._webhook_fingerprint = self._compute_webhook_fingerprint(cfg.webhook_url)
         self._account_leverage: float = cfg.exposure_default_leverage
         self._execution_history: list[dict] = self._load_execution_history()
+        self._active_signal_keys: set[str] = set()
         self._efficiency_history: Deque[dict[str, float]] = deque(maxlen=6)
         self._dynamic_ml_shift: float = 0.0
         self._adaptive_cooldown_minutes: float = 0.0
@@ -69,6 +70,8 @@ class OrderManager:
         stats = ExecutionCycleStats(signals_received=len(signals))
         if not signals:
             return stats
+        all_positions = self.adapter.get_positions()
+        self._update_active_signal_keys(all_positions)
         candidates: List[EntrySignal] = []
         for signal in signals:
             if not self._signal_passes_validation(signal):
@@ -82,7 +85,7 @@ class OrderManager:
             return stats
         if not self.adapter.connected:
             raise RuntimeError("MT5 nicht verbunden")
-        existing_positions = self.adapter.get_positions(symbol)
+        existing_positions = [pos for pos in all_positions if pos.get("symbol") == symbol]
         limited_signals = candidates[: self.cfg.max_open_trades]
         for idx, signal in enumerate(limited_signals):
             open_positions = existing_positions if idx == 0 else self.adapter.get_positions(symbol)
@@ -218,10 +221,9 @@ class OrderManager:
                 should_continue = self._process_execution_result(symbol, signal.direction, result)
                 if result.get("retcode") == self.SUCCESS_RETCODE:
                     self._last_confidence[symbol] = confidence
-                if result.get("retcode") == self.SUCCESS_RETCODE:
-                    self._record_execution(symbol, signal)
+                    self._record_execution(symbol, signal, result)
                     stats.executed_trades += 1
-                    self._last_confidence[symbol] = confidence
+                    self._active_signal_keys.add(self._signal_key(symbol, signal))
                 if not should_continue:
                     break
             except Exception as exc:
@@ -445,20 +447,53 @@ class OrderManager:
 
     @staticmethod
     def _signal_key(symbol: str, signal: EntrySignal) -> str:
-        return f"{symbol}:{signal.direction}"
+        direction = signal.direction.value if isinstance(signal.direction, Dir) else str(signal.direction)
+        return f"{symbol}:{direction}"
 
     def _already_executed(self, symbol: str, signal: EntrySignal) -> bool:
         key = self._signal_key(symbol, signal)
-        return any(entry.get("key") == key for entry in self._execution_history)
+        return key in self._active_signal_keys
 
-    def _record_execution(self, symbol: str, signal: EntrySignal) -> None:
-        self._execution_history.append({
+    def _record_execution(self, symbol: str, signal: EntrySignal, result: dict) -> None:
+        record = {
             "key": self._signal_key(symbol, signal),
             "symbol": symbol,
             "direction": signal.direction,
-            "timestamp": signal.entry_time.isoformat()
-        })
+            "timestamp": signal.entry_time.isoformat(),
+        }
+        ticket = result.get("deal") or result.get("order") or result.get("position")
+        if ticket:
+            record["ticket"] = ticket
+        self._execution_history.append(record)
         self._save_execution_history()
+
+    def _direction_from_position(self, position: dict) -> Optional[Dir]:
+        try:
+            volume = float(position.get("volume", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if volume > 0:
+            return Dir.UP
+        if volume < 0:
+            return Dir.DOWN
+        return None
+
+    def _position_key_from_entry(self, position: dict) -> Optional[str]:
+        symbol = position.get("symbol")
+        direction = self._direction_from_position(position)
+        if not symbol or direction is None:
+            return None
+        return f"{symbol}:{direction.value}"
+
+    def _update_active_signal_keys(self, positions: Optional[List[dict]] = None) -> None:
+        if positions is None:
+            positions = self.adapter.get_positions()
+        keys: set[str] = set()
+        for position in positions or []:
+            key = self._position_key_from_entry(position)
+            if key:
+                keys.add(key)
+        self._active_signal_keys = keys
     
     def _signal_passes_validation(self, signal: EntrySignal) -> bool:
         if signal.entry_zone is None:

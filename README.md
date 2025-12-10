@@ -32,6 +32,7 @@ python main.py --once --dry-run
 1. `main.py` lädt Konfigurationen und verbindet sich via `MetaTrader5Adapter`.
 2. `SignalEngine` verarbeitet die aktuellen Kursdaten und liefert Entry-Signale.
 3. `OrderManager` sendet Market-Orders mit Stop/TP und verfolgt offene Positionen.
+4. Offene Positionen werden live nachgeführt, damit das System nach einem Restart nicht mehrfach denselben Setup ausführt.
 
 ## Nächste Schritte
 
