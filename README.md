@@ -38,3 +38,9 @@ python main.py --once --dry-run
 - Erweiterte Risikosteuerung (vol-target, Drawdown-Protektion).
 - Logging/Monitoring (z.B. Equity-Graph, Notifications).
 - Integration mit Vantage-REST-API für sekundäre Checks oder Absicherungen.
+
+## Dynamic Position Sizing
+
+- `dynamic_trend_scaling` erlaubt es, Größe auf Basis von Setup- und Zeitrahmen-Stärke selbst anzupassen.
+- Die Mappings `setup_size_factors` und `tf_size_factors` definieren individuelle Skalierungsfaktoren für W3/C/W5-Setups oder etwaige H1/M30-Zyklen.
+- Dadurch reagiert das Live-System automatisch etwas zurückhaltender auf schwächere Signale.

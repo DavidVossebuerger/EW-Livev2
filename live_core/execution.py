@@ -701,6 +701,16 @@ class OrderManager:
         scale = self.cfg.target_annual_vol / (std * 4)
         return max(0.4, min(1.6, scale))
 
+    def _dynamic_trend_scale(self, signal: EntrySignal) -> float:
+        if not self.cfg.dynamic_trend_scaling:
+            return 1.0
+        scale = 1.0
+        entry_tf = (signal.entry_tf or "").upper()
+        scale *= self.cfg.tf_size_factors.get(entry_tf, 1.0)
+        setup_key = (signal.setup or "").upper()
+        scale *= self.cfg.setup_size_factors.get(setup_key, 1.0)
+        return max(0.6, min(scale, 1.5))
+
     def _record_expected_return(self, entry_price: float, stop_price: float, take_profit: float) -> None:
         if not self.cfg.use_vol_target:
             return
@@ -746,6 +756,7 @@ class OrderManager:
             lots *= scale
         if signal.direction == Dir.DOWN:
             lots *= self.cfg.size_short_factor
+        lots *= self._dynamic_trend_scale(signal)
         lots = max(self.cfg.min_lot, lots)
         lots = min(lots, self.cfg.max_lot)
         if self.cfg.max_gross_exposure_pct > 0:

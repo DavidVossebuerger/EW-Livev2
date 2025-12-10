@@ -57,6 +57,9 @@ AGGRESSIVE_PROFILE_DEFAULTS: Dict[str, Any] = {
     "prob_size_max": 1.5,
     "ml_probability_threshold": 0.65,
     "ml_threshold_shift": 0.0,
+    "dynamic_trend_scaling": True,
+    "setup_size_factors": {"C": 1.0, "W3": 0.85, "W5": 0.8},
+    "tf_size_factors": {"H1": 1.0, "M30": 0.9},
 }
 
 
@@ -90,6 +93,9 @@ class LiveConfig:
     size_by_prob: bool = False
     prob_size_min: float = 0.7
     prob_size_max: float = 1.5
+    dynamic_trend_scaling: bool = True
+    setup_size_factors: Dict[str, float] = field(default_factory=lambda: {"C": 1.0, "W3": 0.85, "W5": 0.8})
+    tf_size_factors: Dict[str, float] = field(default_factory=lambda: {"H1": 1.0, "M30": 0.9})
     use_pending_orders: bool = True
     pending_order_expiry_minutes: int = 120
     order_cooldown_seconds: int = 1
