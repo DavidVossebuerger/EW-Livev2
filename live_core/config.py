@@ -41,18 +41,18 @@ AGGRESSIVE_PROFILE_DEFAULTS: Dict[str, Any] = {
     "adx_period": 14,
     "adx_trend_threshold": 25.0,
     "order_store_path": "logs/placed_orders.json",
-    "risk_per_trade": 0.01,
+    "risk_per_trade": 0.04,
     "dynamic_dd_risk": True,
     "dd_risk_steps": ((-10.0, 0.75), (-20.0, 0.5), (-30.0, 0.35), (-40.0, 0.25)),
     "use_vol_target": False,
     "target_annual_vol": 0.25,
     "vol_window_trades": 40,
-    "risk_per_trade_min": 0.002,
-    "risk_per_trade_max": 0.02,
+    "risk_per_trade_min": 0.04,
+    "risk_per_trade_max": 0.04,
     "size_short_factor": 0.7,
     "allow_shorts": True,
     "use_ml_filters": True,
-    "size_by_prob": True,
+    "size_by_prob": False,
     "prob_size_min": 0.7,
     "prob_size_max": 1.5,
     "ml_probability_threshold": 0.65,
@@ -60,6 +60,7 @@ AGGRESSIVE_PROFILE_DEFAULTS: Dict[str, Any] = {
     "dynamic_trend_scaling": True,
     "setup_size_factors": {"C": 1.0, "W3": 0.85, "W5": 0.8},
     "tf_size_factors": {"H1": 1.0, "M30": 0.9},
+    "max_gross_exposure_pct": 0.05,
 }
 
 
@@ -72,7 +73,7 @@ class LiveConfig:
     lookback_bars: int = 500
     risk_per_trade: float = 0.01
     lot_size_per_risk_point: float = 1.0
-    account_balance: float = 100000.0
+    account_balance: float = 10000.0
     min_lot: float = 0.01
     max_lot: float = 10.0
     max_open_trades: int = 1
@@ -106,7 +107,7 @@ class LiveConfig:
     trade_cooldown_minutes: int = 30
     max_trades_per_symbol_per_hour: int = 2
     min_profit_factor: float = 1.0
-    max_gross_exposure_pct: float = 0.03
+    max_gross_exposure_pct: float = 0.0
     price_guard_margin: float = 0.0
     exposure_basis: str = "margin"
     exposure_custom_factor: float = 1.0

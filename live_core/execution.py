@@ -26,7 +26,7 @@ logger = logging.getLogger("ew_live")
 
 @dataclass
 class ExecutionCycleStats:
-    signals_received: int = 0
+    signals_received: int = 0  # neue, im Zyklus berücksichtigte Signale (keine Duplikate)
     validated_signals: int = 0
     duplicate_signals: int = 0
     executed_trades: int = 0
@@ -59,6 +59,9 @@ class OrderManager:
         self._webhook_fingerprint = self._compute_webhook_fingerprint(cfg.webhook_url)
         self._account_leverage: float = cfg.exposure_default_leverage
         self._execution_history: list[dict] = self._load_execution_history()
+        self._history_active_keys: set[str] = self._initial_active_keys_from_history()
+        self._active_store: dict[str, dict] = self._load_active_store()
+        self._active_store_max_age = timedelta(hours=12)
         self._active_signal_keys: set[str] = set()
         self._efficiency_history: Deque[dict[str, float]] = deque(maxlen=6)
         self._dynamic_ml_shift: float = 0.0
@@ -67,7 +70,7 @@ class OrderManager:
             logger.info(f"Webhook aktiviert (Fingerprint={self._webhook_fingerprint})")
 
     def evaluate_signals(self, symbol: str, signals: List[EntrySignal]) -> ExecutionCycleStats:
-        stats = ExecutionCycleStats(signals_received=len(signals))
+        stats = ExecutionCycleStats()
         if not signals:
             return stats
         all_positions = self.adapter.get_positions()
@@ -81,6 +84,7 @@ class OrderManager:
                 stats.duplicate_signals += 1
                 continue
             candidates.append(signal)
+            stats.signals_received += 1
         if not candidates:
             return stats
         if not self.adapter.connected:
@@ -468,6 +472,52 @@ class OrderManager:
         with path.open("w", encoding="utf-8") as fh:
             json.dump(self._execution_history, fh, ensure_ascii=False, indent=2)
 
+    def _active_store_path(self) -> Path:
+        # nutzt den gleichen Ordner wie order_store_path
+        base = Path(self.cfg.order_store_path or "logs/placed_orders.json").resolve()
+        return base.parent / "active_positions.json"
+
+    def _load_active_store(self) -> dict[str, dict]:
+        path = self._active_store_path()
+        if not path.exists():
+            return {}
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_active_store(self) -> None:
+        path = self._active_store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(self._active_store, fh, ensure_ascii=False, indent=2)
+
+    def _initial_active_keys_from_history(self) -> set[str]:
+        """Fallback: wenn MT5-Positionsabruf fehlschlägt, verhindere Duplikate mit jüngster Historie."""
+        if not self._execution_history:
+            return set()
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+        except Exception:
+            return set()
+        keys: set[str] = set()
+        for record in reversed(self._execution_history[-200:]):  # nur jüngste Einträge prüfen
+            ts = record.get("timestamp")
+            try:
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt < cutoff:
+                break
+            key = record.get("key")
+            if key:
+                keys.add(key)
+        return keys
+
     @staticmethod
     def _signal_key(symbol: str, signal: EntrySignal) -> str:
         direction = signal.direction.value if isinstance(signal.direction, Dir) else str(signal.direction)
@@ -489,6 +539,8 @@ class OrderManager:
             record["ticket"] = ticket
         self._execution_history.append(record)
         self._save_execution_history()
+        if ticket:
+            self._record_active_ticket(ticket, record["key"], symbol)
 
     def _direction_from_position(self, position: dict) -> Optional[Dir]:
         try:
@@ -508,14 +560,59 @@ class OrderManager:
             return None
         return f"{symbol}:{direction.value}"
 
+    def _record_active_ticket(self, ticket: Any, key: str, symbol: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self._active_store[str(ticket)] = {"key": key, "symbol": symbol, "last_seen": now, "opened": now}
+        self._save_active_store()
+
+    def _prune_active_store(self, now: datetime, seen_tickets: set[str]) -> None:
+        if not self._active_store:
+            return
+        cutoff = now - self._active_store_max_age
+        to_delete = []
+        for ticket, entry in self._active_store.items():
+            if ticket in seen_tickets:
+                continue
+            ts = entry.get("last_seen") or entry.get("opened")
+            try:
+                dt = datetime.fromisoformat(ts)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                dt = None
+            if dt is None or dt < cutoff:
+                to_delete.append(ticket)
+        for ticket in to_delete:
+            self._active_store.pop(ticket, None)
+        if to_delete:
+            self._save_active_store()
+
     def _update_active_signal_keys(self, positions: Optional[List[dict]] = None) -> None:
         if positions is None:
             positions = self.adapter.get_positions()
         keys: set[str] = set()
+        seen_tickets: set[str] = set()
+        now = datetime.now(timezone.utc)
         for position in positions or []:
             key = self._position_key_from_entry(position)
+            ticket = position.get("ticket") or position.get("position") or position.get("order")
             if key:
                 keys.add(key)
+            if ticket and key:
+                seen_tickets.add(str(ticket))
+                self._active_store[str(ticket)] = {
+                    "key": key,
+                    "symbol": position.get("symbol"),
+                    "last_seen": now.isoformat(),
+                }
+        # Fallback auf Historie, falls Positionsabruf nichts liefert (z. B. Adapter-Fehler)
+        if not keys and self._history_active_keys:
+            keys |= self._history_active_keys
+        # Entferne veraltete oder geschlossene Tickets
+        self._prune_active_store(now, seen_tickets)
+        if not keys:
+            # nutze aktive Store-Einträge (jüngst gesehen) als letzte Sicherung gegen Duplikate
+            keys |= {entry.get("key") for entry in self._active_store.values() if entry.get("key")}
         self._active_signal_keys = keys
     
     def _signal_passes_validation(self, signal: EntrySignal) -> bool:

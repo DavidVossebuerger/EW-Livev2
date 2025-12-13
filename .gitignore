@@ -5,3 +5,6 @@ logs/
 *.log
 Ergebnisse/
 auth.db
+daten-kurs/
+daten/*.csv
+tmp_patch.ps1
