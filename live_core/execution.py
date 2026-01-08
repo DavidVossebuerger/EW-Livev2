@@ -702,10 +702,32 @@ class OrderManager:
         return f"{symbol}:{direction}:{setup}:{bucket}{zone_id}"
 
     @staticmethod
+    def _normalize_symbol_base(symbol: str) -> str:
+        """Normalize symbol to base name (ETSY.NYS, ETSY.NAS -> ETSY)."""
+        if not symbol:
+            return symbol
+        # Remove common exchange suffixes
+        for suffix in [".NYS", ".NAS", ".NYSE", ".NASDAQ", ".US", ".DE", ".UK"]:
+            if symbol.upper().endswith(suffix):
+                return symbol[:-len(suffix)]
+        # Also handle dot-separated symbols like ETSY.NYS
+        if "." in symbol:
+            base = symbol.split(".")[0]
+            # Only return base if the part after dot looks like exchange
+            rest = symbol.split(".", 1)[1] if len(symbol.split(".", 1)) > 1 else ""
+            if rest.upper() in ["NYS", "NAS", "NYSE", "NASDAQ", "US", "DE", "UK", "L", "O", "K"]:
+                return base
+        return symbol
+
+    @staticmethod
     def _signal_key_simple(symbol: str, signal: EntrySignal) -> str:
-        """Simple key for active position tracking (symbol + direction only)."""
+        """Simple key for active position tracking (symbol + direction only).
+        
+        Uses normalized base symbol to treat ETSY.NYS and ETSY.NAS as same stock.
+        """
         direction = signal.direction.value if isinstance(signal.direction, Dir) else str(signal.direction)
-        return f"{symbol}:{direction}"
+        base_symbol = OrderManager._normalize_symbol_base(symbol)
+        return f"{base_symbol}:{direction}"
 
     def _already_executed(self, symbol: str, signal: EntrySignal) -> bool:
         """Check if this signal was already executed recently.
@@ -826,11 +848,16 @@ class OrderManager:
             return None
 
     def _position_key_from_entry(self, position: dict) -> Optional[str]:
+        """Extract simple key (base_symbol:direction) from position.
+        
+        Uses normalized base symbol to treat ETSY.NYS and ETSY.NAS as same stock.
+        """
         symbol = position.get("symbol")
         direction = self._direction_from_position(position)
         if not symbol or direction is None:
             return None
-        return f"{symbol}:{direction.value}"
+        base_symbol = self._normalize_symbol_base(symbol)
+        return f"{base_symbol}:{direction.value}"
 
     def _record_active_ticket(self, ticket: Any, key: str, symbol: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -927,12 +954,26 @@ class OrderManager:
         if to_delete:
             self._order_store.delete_tickets(to_delete)
 
+    def _order_key_from_pending(self, order: dict) -> Optional[str]:
+        """Extract simple key (base_symbol:direction) from a pending order.
+        
+        Uses normalized base symbol to treat ETSY.NYS and ETSY.NAS as same stock.
+        """
+        symbol = order.get("symbol")
+        direction = order.get("direction")
+        if not symbol or not direction:
+            return None
+        base_symbol = self._normalize_symbol_base(symbol)
+        return f"{base_symbol}:{direction}"
+
     def _update_active_signal_keys(self, positions: Optional[List[dict]] = None) -> None:
         if positions is None:
             positions = self.adapter.get_positions()
         keys: set[str] = set()
         seen_tickets: set[str] = set()
         now = datetime.now(timezone.utc)
+        
+        # 1. Offene Positionen prüfen
         for position in positions or []:
             key = self._position_key_from_entry(position)
             ticket = position.get("ticket") or position.get("position") or position.get("order")
@@ -945,15 +986,35 @@ class OrderManager:
                     "symbol": position.get("symbol"),
                     "last_seen": now.isoformat(),
                 }
-        # Fallback auf Historie, falls Positionsabruf nichts liefert (z. B. Adapter-Fehler)
+        
+        # 2. KRITISCH: Auch pending Orders prüfen (verhindert Duplikate bei Limit Orders!)
+        pending_orders = self.adapter.get_orders()
+        for order in pending_orders or []:
+            key = self._order_key_from_pending(order)
+            ticket = order.get("ticket") or order.get("order")
+            if key:
+                keys.add(key)
+                logger.debug(f"Pending order tracked: {key}")
+            if ticket and key:
+                seen_tickets.add(str(ticket))
+                self._active_store[str(ticket)] = {
+                    "key": key,
+                    "symbol": order.get("symbol"),
+                    "last_seen": now.isoformat(),
+                    "pending": True,
+                }
+        
+        # Fallback auf Historie, falls Positionsabruf nichts liefert
         if not keys and self._history_active_keys:
             keys |= self._history_active_keys
         # Entferne veraltete oder geschlossene Tickets
         self._prune_active_store(now, seen_tickets)
         if not keys:
-            # nutze aktive Store-EintrÃ¤ge (jÃ¼ngst gesehen) als letzte Sicherung gegen Duplikate
             keys |= {entry.get("key") for entry in self._active_store.values() if entry.get("key")}
         self._active_signal_keys = keys
+        
+        if keys:
+            logger.debug(f"Active signal keys (positions+orders): {keys}")
     
     def _signal_passes_validation(self, signal: EntrySignal) -> bool:
         if signal.entry_zone is None:

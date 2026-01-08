@@ -540,6 +540,8 @@ class MetaTrader5Adapter:
                 "deviation": 5,
                 "type_filling": filling_mode,
             }
+            # Debug logging for SL/TP
+            print(f"[MT5] Limit Order Request: {symbol} @ {price:.5f} SL={sl_safe:.5f} TP={tp_safe:.5f}")
             request["type_time"] = mt5.ORDER_TIME_GTC
             if expiration and expiration > 0:
                 request["type_time"] = mt5.ORDER_TIME_SPECIFIED
