@@ -61,7 +61,7 @@ AGGRESSIVE_PROFILE_DEFAULTS: Dict[str, Any] = {
     "vola_lookback_bars": 400,
     "vola_min_samples": 80,
     "min_stop_atr_mult": 1.0,
-    "min_stop_pct": 0.005,
+    "min_stop_pct": 0.003,
     "signal_dedup_window_minutes": 120,
     "use_vola_forecast": True,
     "vola_forecast_window": 252,
@@ -118,7 +118,7 @@ class LiveConfig:
     entry_buffer_atr: float = 0.25
     stop_loss_multiplier: float = 1.5
     take_profit_multiplier: float = 1.0
-    min_stop_distance_pct: float = 0.002
+    min_stop_distance_pct: float = 0.003
     trade_cooldown_minutes: int = 30
     max_trades_per_symbol_per_hour: int = 2
     min_profit_factor: float = 1.2
@@ -185,7 +185,7 @@ class LiveConfig:
     # Minimum SL distance as multiple of ATR (prevents too tight stops)
     min_stop_atr_mult: float = 1.0
     # Fallback minimum SL distance as percentage of entry price
-    min_stop_pct: float = 0.005
+    min_stop_pct: float = 0.003
     # Signal deduplication window in minutes (same setup within window = duplicate)
     signal_dedup_window_minutes: int = 120
     # Volatility Forecast-based Position Sizing

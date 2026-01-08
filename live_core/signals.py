@@ -570,8 +570,8 @@ class SignalEngine:
         # CRITICAL FIX: Enforce minimum stop distance
         # The stop must be at least min_stop_atr_mult * ATR away from entry
         min_atr_dist = atr * getattr(self.cfg, "min_stop_atr_mult", 1.0)
-        # Also enforce minimum percentage distance
-        min_pct_dist = entry_price * getattr(self.cfg, "min_stop_pct", 0.005)
+        # Also enforce minimum percentage distance (0.3% default, same as backtest)
+        min_pct_dist = entry_price * getattr(self.cfg, "min_stop_pct", 0.003)
         min_stop_distance = max(min_atr_dist, min_pct_dist)
         
         actual_stop_distance = abs(entry_price - stop)
