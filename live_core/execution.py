@@ -110,7 +110,10 @@ class OrderManager:
         sensitivities = self.risk_manager.calculate_sensitivities(
             signal, market_data, historical_outcomes
         )
-        market_uncertainty = {"volatility": market_data.get("volatility", 0.0)}
+        market_uncertainty = {
+            "volatility": market_data.get("volatility", 0.0),
+            "symbol": symbol,  # For vola forecast lookup
+        }
         adjusted = self.risk_manager.adjust_position_size_for_sensitivities(
             base_volume, sensitivities, market_uncertainty
         )
@@ -296,7 +299,8 @@ class OrderManager:
                     self._last_confidence[symbol] = confidence
                     self._record_execution(symbol, signal, result)
                     stats.executed_trades += 1
-                    self._active_signal_keys.add(self._signal_key(symbol, signal))
+                    # Add simple key to active keys (for position tracking)
+                    self._active_signal_keys.add(self._signal_key_simple(symbol, signal))
                 if not should_continue:
                     break
             except Exception as exc:
@@ -480,6 +484,7 @@ class OrderManager:
         return limit_price >= current_price + eps
 
     def _scale_order_levels(self, signal: EntrySignal) -> Tuple[float, float]:
+        """Scale stop and TP levels, enforcing minimum stop distance."""
         entry = signal.entry_price
         stop = signal.stop_loss
         tp = signal.take_profit
@@ -499,6 +504,21 @@ class OrderManager:
                 tp = entry + scaled_tp_delta
             else:
                 tp = entry - scaled_tp_delta
+        
+        # CRITICAL: Enforce minimum stop distance to prevent instant stop-outs
+        min_stop_pct = getattr(self.cfg, "min_stop_pct", 0.005)
+        min_stop_dist = entry * min_stop_pct
+        actual_stop_dist = abs(entry - stop)
+        
+        if actual_stop_dist < min_stop_dist:
+            logger.warning(
+                f"Stop distance {actual_stop_dist:.5f} below minimum {min_stop_dist:.5f}, expanding stop"
+            )
+            if signal.direction == Dir.UP:
+                stop = entry - min_stop_dist
+            else:
+                stop = entry + min_stop_dist
+        
         return stop, tp
 
     def _log_order(
@@ -659,19 +679,93 @@ class OrderManager:
 
     @staticmethod
     def _signal_key(symbol: str, signal: EntrySignal) -> str:
+        """Generate a unique key for signal deduplication.
+        
+        Uses symbol, direction, setup type, and a time-bucketed identifier
+        to properly distinguish between different setups while still preventing
+        rapid-fire duplicate orders on the same setup.
+        """
+        direction = signal.direction.value if isinstance(signal.direction, Dir) else str(signal.direction)
+        setup = signal.setup or "unknown"
+        # Bucket entry time to 2-hour windows for dedup (prevents same setup spam)
+        entry_ts = signal.entry_time
+        if hasattr(entry_ts, "timestamp"):
+            # Round to 2-hour buckets
+            bucket = int(entry_ts.timestamp() // 7200) * 7200
+        else:
+            bucket = 0
+        # Include zone center for additional uniqueness
+        zone_id = ""
+        if signal.entry_zone:
+            zone_center = (signal.entry_zone[0] + signal.entry_zone[1]) / 2
+            zone_id = f":{zone_center:.2f}"
+        return f"{symbol}:{direction}:{setup}:{bucket}{zone_id}"
+
+    @staticmethod
+    def _signal_key_simple(symbol: str, signal: EntrySignal) -> str:
+        """Simple key for active position tracking (symbol + direction only)."""
         direction = signal.direction.value if isinstance(signal.direction, Dir) else str(signal.direction)
         return f"{symbol}:{direction}"
 
     def _already_executed(self, symbol: str, signal: EntrySignal) -> bool:
-        key = self._signal_key(symbol, signal)
-        return key in self._active_signal_keys
+        """Check if this signal was already executed recently.
+        
+        Uses two-level check:
+        1. Simple key check against active positions (prevents multiple positions same direction)
+        2. Full key check against recent execution history (prevents rapid duplicate orders)
+        """
+        # Level 1: Check if we already have an active position in this direction
+        simple_key = self._signal_key_simple(symbol, signal)
+        if simple_key in self._active_signal_keys:
+            return True
+        
+        # Level 2: Check recent execution history for same setup within dedup window
+        full_key = self._signal_key(symbol, signal)
+        dedup_window = getattr(self.cfg, "signal_dedup_window_minutes", 120)
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(minutes=dedup_window)
+        
+        for record in reversed(self._execution_history[-100:]):
+            rec_key = record.get("key", "")
+            # Check if keys match (including setup and zone)
+            if rec_key == full_key:
+                ts_str = record.get("timestamp")
+                if ts_str:
+                    try:
+                        rec_time = datetime.fromisoformat(ts_str)
+                        if rec_time.tzinfo is None:
+                            rec_time = rec_time.replace(tzinfo=timezone.utc)
+                        if rec_time > cutoff:
+                            return True
+                    except Exception:
+                        pass
+            # Also block if same symbol+direction executed very recently (within 5 minutes)
+            rec_symbol = record.get("symbol")
+            rec_dir = record.get("direction")
+            rec_dir_val = rec_dir.value if isinstance(rec_dir, Dir) else str(rec_dir) if rec_dir else ""
+            signal_dir_val = signal.direction.value if isinstance(signal.direction, Dir) else str(signal.direction)
+            if rec_symbol == symbol and rec_dir_val == signal_dir_val:
+                ts_str = record.get("timestamp")
+                if ts_str:
+                    try:
+                        rec_time = datetime.fromisoformat(ts_str)
+                        if rec_time.tzinfo is None:
+                            rec_time = rec_time.replace(tzinfo=timezone.utc)
+                        if rec_time > now - timedelta(minutes=5):
+                            return True
+                    except Exception:
+                        pass
+        return False
 
     def _record_execution(self, symbol: str, signal: EntrySignal, result: dict) -> None:
         record = {
             "key": self._signal_key(symbol, signal),
+            "simple_key": self._signal_key_simple(symbol, signal),
             "symbol": symbol,
             "direction": signal.direction,
-            "timestamp": signal.entry_time.isoformat(),
+            "setup": signal.setup,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal_time": signal.entry_time.isoformat() if signal.entry_time else None,
         }
         ticket = result.get("deal") or result.get("order") or result.get("position")
         if ticket:

@@ -23,6 +23,13 @@ from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
 from sklearn.inspection import permutation_importance
 
+# Volatility Forecaster (optional)
+try:
+    from volatility_backtest import VolatilityForecaster, create_vola_forecaster
+    VOLA_FORECAST_AVAILABLE = True
+except ImportError:
+    VOLA_FORECAST_AVAILABLE = False
+
 plt.style.use('seaborn-v0_8-darkgrid')
 
 # --------------------------------------------------------------------------------------
@@ -309,6 +316,26 @@ def parse_args():
     p.add_argument("--deep-eval-min-trades", type=int, default=300, help="Minimale Trades für Gültigkeit")
     p.add_argument("--deep-eval-max-dd", type=float, default=-5.0, help="Max Drawdown Constraint (z.B. -5.0)")
     p.add_argument("--secondary-threshold", type=float, default=None, help="Sekundärer Schwellenwert (optional)")
+    # Neutral Mode – removes overfitting-prone optimizations
+    p.add_argument("--neutral", action="store_true", help="Neutraler Backtest: fester Threshold, kein Risk-Scaling, keine Offsets, kein SIZE_BY_PROB")
+    # Momentum Filter (like live system)
+    p.add_argument("--momentum", action="store_true", help="Momentum-Filter aktivieren: Trade nur wenn Momentum mit Richtung übereinstimmt")
+    p.add_argument("--momentum-period", type=int, default=14, help="Momentum Lookback Periode (default: 14 Bars)")
+    p.add_argument("--momentum-threshold", type=float, default=0.0, help="Minimum Momentum Threshold (default: 0.0 = nur Richtung)")
+    # Momentum Exit (early exit when momentum weakens on higher TF)
+    p.add_argument("--momentum-exit", type=int, default=0, help="Momentum Exit: Schließe nach N abnehmenden Momentum-Bars auf H1 (0=aus, 2-3 empfohlen)")
+    # ADX / Regime Filter
+    p.add_argument("--use-adx", action="store_true", help="ADX-Filter aktivieren (filtert Trades bei ADX < Threshold)")
+    p.add_argument("--adx-threshold", type=int, default=25, help="ADX Threshold für Trendstärke (default: 25)")
+    # Volatility Regime Analysis
+    p.add_argument("--analyze-regimes", action="store_true", help="Performance nach Volatilitäts-Regimes analysieren")
+    p.add_argument("--vola-min", type=int, default=0, help="Min ATR-Percentile für Trades (0-100, z.B. 25 = keine Low-Vola)")
+    p.add_argument("--vola-max", type=int, default=100, help="Max ATR-Percentile für Trades (0-100, z.B. 75 = keine High-Vola)")
+    # Volatility Forecast Sizing (GARCH+HAR based)
+    p.add_argument("--vola-forecast", action="store_true", help="Vola-Prognose für Position Sizing aktivieren")
+    p.add_argument("--vola-forecast-window", type=int, default=252, help="Trainings-Fenster für Vola-Modell (default: 252 Tage)")
+    # Local Data (statt yfinance)
+    p.add_argument("--local-data", type=str, default=None, help="Pfad zu lokalen Daten (Basis-Name, z.B. 'daten/xauusd' lädt _daily.csv, _h1.csv, _m30.csv)")
     # Manuelle Schwellen / Offsets
     p.add_argument("--thr-shift", type=float, default=None, help="Globaler Threshold Shift (additiv)")
     p.add_argument("--thr-off-w3", type=float, default=None, help="Offset W3")
@@ -921,7 +948,78 @@ def _merge_history(symbol:str, cur:pd.DataFrame, hist_path:str) -> pd.DataFrame:
         print(f"[WARN] Merge {os.path.basename(hist_path)}: {e}")
     return cur
 
+def load_local_data(base_path: str):
+    """Load data from local CSV files (resampled from tick/M30 data).
+    
+    Args:
+        base_path: Base path without suffix, e.g. 'daten/xauusd'
+                   Will load: {base_path}_daily.csv, {base_path}_h1.csv, {base_path}_m30.csv
+    
+    Returns:
+        Tuple of (daily, h1, m30) DataFrames
+    """
+    import os
+    
+    daily_path = f"{base_path}_daily.csv"
+    h1_path = f"{base_path}_h1.csv"
+    m30_path = f"{base_path}_m30.csv"
+    
+    print(f"[LOCAL] Loading data from: {base_path}_*.csv")
+    
+    def _load_csv(path, label):
+        if not os.path.exists(path):
+            print(f"[LOCAL] {label} not found: {path}")
+            return pd.DataFrame()
+        
+        df = pd.read_csv(path)
+        
+        # Normalize column names
+        df.columns = [c.lower() for c in df.columns]
+        
+        # Parse date column
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+        elif 'timestamp' in df.columns:
+            df['date'] = pd.to_datetime(df['timestamp'])
+            df = df.drop(columns=['timestamp'])
+        
+        # Ensure required columns exist
+        required = ['open', 'high', 'low', 'close']
+        for col in required:
+            if col not in df.columns:
+                print(f"[LOCAL] Warning: {label} missing column '{col}'")
+                return pd.DataFrame()
+        
+        # Rename to match backtester expectations
+        df = df.rename(columns={
+            'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close',
+            'volume': 'Volume', 'atr': 'ATR'
+        })
+        
+        # Convert back to lowercase (backtester expectation)
+        df.columns = [c.lower() for c in df.columns]
+        
+        print(f"[LOCAL] {label}: {len(df):,} bars | {df['date'].iloc[0].date()} to {df['date'].iloc[-1].date()}")
+        return df
+    
+    daily = _load_csv(daily_path, "Daily")
+    h1 = _load_csv(h1_path, "H1")
+    m30 = _load_csv(m30_path, "M30")
+    
+    # Add all required indicators (ATR, ATR_PCT, EMA, RSI, ADX)
+    # Use add_all_indicators to ensure consistency with yfinance path
+    daily, h1, m30 = add_all_indicators(daily, h1, m30)
+    
+    return daily, h1, m30
+
+
 def load_data():
+    # Check if local data path is specified
+    local_path = CFG.get("LOCAL_DATA_PATH")
+    if local_path:
+        print(f"[LOCAL] Using local data: {local_path}")
+        return load_local_data(local_path)
+    
     sym = CFG["SYMBOL"]
     print(f"[{CFG['_PROFILE']}] Lade {sym}: Daily={CFG['DAILY_PERIOD']} | 1H={CFG['H1_PERIOD']} | 30m={CFG['M30_PERIOD']}")
     if CFG.get("USE_CSV", False):
@@ -1108,6 +1206,8 @@ def add_all_indicators(daily: pd.DataFrame, h1: pd.DataFrame, m30: pd.DataFrame)
     daily = add_indicators(daily)
     h1 = add_indicators(h1)
     m30 = add_indicators(m30)
+    # Add ADX to daily for regime analysis/filtering
+    compute_adx(daily, n=14, out_col="ADX_14")
     return daily, h1, m30
 
 # Einfacher ADX(14)-Berechner (Fallback, falls pandas_ta nicht verfügbar)
@@ -1141,6 +1241,7 @@ class Dir(Enum):
 @dataclass
 class Pivot:
     idx:int; price:float; kind:str  # 'H'/'L'
+    confirm_idx:int = -1  # Index where pivot was confirmed (lookahead-free)
 
 @dataclass
 class Impulse:
@@ -1160,6 +1261,12 @@ class ElliottEngine:
         return max(base*pct, atr*atr_mult)
 
     def zigzag(self, close:np.ndarray, atr:np.ndarray)->List[Pivot]:
+        """ZigZag with realistic pivot confirmation.
+        
+        Each pivot now tracks confirm_idx: the bar index where the pivot was
+        confirmed (when price moved away by the threshold). This is the earliest
+        bar where a live system could know the pivot exists.
+        """
         piv=[]
         if len(close)<3: return piv
         last=close[0]; hi=last; lo=last; hi_i=0; lo_i=0; direction=None
@@ -1169,11 +1276,15 @@ class ElliottEngine:
             if direction in (None, Dir.UP):
                 if p>hi: hi=p; hi_i=i
                 if hi-p>=thr:
-                    piv.append(Pivot(hi_i,float(hi),'H')); last=hi; lo=p; lo_i=i; direction=Dir.DOWN
+                    # Pivot at hi_i is confirmed NOW at bar i (not retroactively at hi_i)
+                    piv.append(Pivot(hi_i,float(hi),'H', confirm_idx=i))
+                    last=hi; lo=p; lo_i=i; direction=Dir.DOWN
             if direction in (None, Dir.DOWN):
                 if p<lo: lo=p; lo_i=i
                 if p-lo>=thr:
-                    piv.append(Pivot(lo_i,float(lo),'L')); last=lo; hi=p; hi_i=i; direction=Dir.UP
+                    # Pivot at lo_i is confirmed NOW at bar i
+                    piv.append(Pivot(lo_i,float(lo),'L', confirm_idx=i))
+                    last=lo; hi=p; hi_i=i; direction=Dir.UP
         piv.sort(key=lambda x:x.idx)
         cleaned=[]
         for p in piv:
@@ -1313,11 +1424,64 @@ def confirm_idx(df:pd.DataFrame, touch_i:int, d:Dir, bars:int, allow_touch:bool)
             if d==Dir.DOWN and cl<ef and ef<es: return i
     return end if allow_touch else None
 
-def simulate(df:pd.DataFrame, entry_i:int, entry:float, d:Dir, stop:float, tp1:float, tp2:float, max_bars:int)->Tuple[int,float,float,float,float]:
+def simulate(df:pd.DataFrame, entry_i:int, entry:float, d:Dir, stop:float, tp1:float, tp2:float, max_bars:int,
+             higher_tf_df:pd.DataFrame=None, mom_exit_bars:int=0, mom_period:int=14)->Tuple[int,float,float,float,float]:
+    """
+    Simulate trade with optional momentum-based exit on higher TF.
+    mom_exit_bars: number of consecutive declining momentum bars to trigger exit (0=disabled)
+    """
     pos=1.0; realized=0.0; end=min(entry_i+max_bars, len(df)-1)
     R=abs(entry-stop); extreme=entry; mae=0.0; mfe=0.0
+    
+    # Momentum exit tracking
+    declining_mom_count = 0
+    last_mom = None
+    entry_time = df.iloc[entry_i]["date"] if "date" in df.columns else None
+    
     for i in range(entry_i+1,end+1):
         r=df.iloc[i]; lo=float(r["low"]); hi=float(r["high"])
+        current_time = r["date"] if "date" in df.columns else None
+        
+        # Check momentum exit on higher TF (if enabled)
+        if mom_exit_bars > 0 and higher_tf_df is not None and current_time is not None and pos > 0:
+            # Find corresponding bar in higher TF
+            htf_mask = higher_tf_df["date"] <= current_time
+            if htf_mask.any():
+                htf_idx = htf_mask.sum() - 1
+                if htf_idx >= mom_period:
+                    # Calculate momentum on higher TF
+                    price_now = float(higher_tf_df.iloc[htf_idx]["close"])
+                    price_past = float(higher_tf_df.iloc[htf_idx - mom_period]["close"])
+                    current_mom = (price_now - price_past) / max(price_past, 1e-9)
+                    
+                    # Track declining momentum
+                    if last_mom is not None:
+                        # For LONG: momentum should stay positive/increasing
+                        # For SHORT: momentum should stay negative/decreasing
+                        if d == Dir.UP:
+                            if current_mom < last_mom:  # momentum weakening
+                                declining_mom_count += 1
+                            else:
+                                declining_mom_count = 0
+                        else:  # SHORT
+                            if current_mom > last_mom:  # momentum weakening (becoming less negative)
+                                declining_mom_count += 1
+                            else:
+                                declining_mom_count = 0
+                        
+                        # Exit if momentum declined for N consecutive bars
+                        if declining_mom_count >= mom_exit_bars:
+                            exit_price = float(r["close"])
+                            if d == Dir.UP:
+                                realized += (exit_price - entry) * pos
+                                mfe = max(mfe, (hi - entry) / R)
+                            else:
+                                realized += (entry - exit_price) * pos
+                                mfe = max(mfe, (entry - lo) / R)
+                            return i, exit_price, realized, mae, mfe
+                    
+                    last_mom = current_mom
+        
         if d==Dir.UP:
             extreme=max(extreme,hi); mae=min(mae,(lo-entry)/R); mfe=max(mfe,(hi-entry)/R)
             if pos==1.0 and (extreme-entry)>=R: stop=max(stop,entry)  # BE nach +1R
@@ -1424,6 +1588,7 @@ def build_features(df: pd.DataFrame, entry_idx: int, d: Dir, setup: str, zone: T
         "dow_sin": dow_sin, "dow_cos": dow_cos,
         "is_us_session": is_us_session,
         # Platzhalter für spätere Injektion prev_win_rate_20
+        # NOTE: prev_win_rate is potentially leaky (uses future labels); set to 0 in neutral mode
         "prev_win_rate_20": 0.0
     }
 
@@ -1447,7 +1612,24 @@ class Backtester:
         self.equity: List[Dict] = []
         self.model = None
         self.threshold = 0.5
-        self.telemetry = dict(setups=0, filtered_daily=0, filtered_ema=0, filtered_vol=0, filtered_volatility=0, filtered_regime=0, no_touch=0, no_confirm=0, accepted=0)
+        self.telemetry = dict(setups=0, filtered_daily=0, filtered_ema=0, filtered_vol=0, filtered_volatility=0, filtered_regime=0, filtered_momentum=0, no_touch=0, no_confirm=0, accepted=0, vola_sized=0)
+        
+        # Volatility Forecast sizing (walk-forward)
+        self.vola_forecaster = None
+        self.vola_forecast_ready = False
+        if CFG.get('USE_VOLA_FORECAST', False) and VOLA_FORECAST_AVAILABLE:
+            try:
+                window = CFG.get('VOLA_FORECAST_WINDOW', 252)
+                self.vola_forecaster = create_vola_forecaster(train_window=window)
+                # Prepare daily data for forecasting
+                if len(self.daily) > window:
+                    self.daily = self.vola_forecaster.prepare_data(self.daily.copy())
+                    self.vola_forecast_ready = True
+                    print(f"[VOLA] Forecaster initialized with {window}-day window")
+                else:
+                    print(f"[VOLA] Not enough daily data ({len(self.daily)} < {window})")
+            except Exception as e:
+                print(f"[VOLA] Forecaster init failed: {e}")
 
     # ---------- Struktur ----------
     def analyze_structure(self):
@@ -1464,28 +1646,47 @@ class Backtester:
         return "1h"
 
     def build_setups(self):
+        """Build setups using lookahead-free pivot confirmation.
+        
+        Setup start time is now based on when the LAST pivot of the pattern
+        was confirmed (confirm_idx), not when it occurred (idx). This prevents
+        lookahead bias where the backtest 'knows' a pivot before it's confirmed.
+        """
         self.setups.clear()
         for imp in self.impulses:
             p0,p1,p2,p3,p4,p5 = imp.points
-            # Symmetrische Zonen/TPs wie im Original
+            # W3 setup: needs p2 confirmed (end of wave 2)
+            # Use confirmation index of last required pivot for this setup
+            # For W3, we need at least p2 confirmed to know wave 1-2 structure
+            setup_confirm_idx = max(p2.confirm_idx if p2.confirm_idx >= 0 else p2.idx + 1, 0)
+            if setup_confirm_idx >= len(self.h1):
+                continue
             z3 = self.h1_engine.fib_zone(p0.price,p1.price,imp.direction,CFG["ENTRY_ZONE_W3"])
-            t3 = self.h1.iloc[p2.idx+1]["date"]; tf3=self._preferred_tf(t3)
+            t3 = self.h1.iloc[setup_confirm_idx]["date"]; tf3=self._preferred_tf(t3)
             tp1_3=self.h1_engine.fib_ext(p0.price,p1.price,imp.direction,CFG["TP1"])
             tp2_3=self.h1_engine.fib_ext(p0.price,p1.price,imp.direction,CFG["TP2"])
-            self.setups.append(Setup("W3", imp.direction, t3, tf3, z3, p0.price, tp1_3, tp2_3, dict(src="impulse")))
+            self.setups.append(Setup("W3", imp.direction, t3, tf3, z3, p0.price, tp1_3, tp2_3, dict(src="impulse", confirm_delay=setup_confirm_idx - p2.idx)))
             if CFG["USE_W5"]:
+                # W5 setup: needs p4 confirmed
+                setup_confirm_idx_w5 = max(p4.confirm_idx if p4.confirm_idx >= 0 else p4.idx + 1, 0)
+                if setup_confirm_idx_w5 >= len(self.h1):
+                    continue
                 z5=self.h1_engine.fib_zone(p2.price,p3.price,imp.direction,CFG["ENTRY_ZONE_W5"])
-                t5=self.h1.iloc[p4.idx+1]["date"]; tf5=self._preferred_tf(t5)
+                t5=self.h1.iloc[setup_confirm_idx_w5]["date"]; tf5=self._preferred_tf(t5)
                 tp1_5=self.h1_engine.fib_ext(p2.price,p3.price,imp.direction,CFG["TP1"])
                 tp2_5=self.h1_engine.fib_ext(p2.price,p3.price,imp.direction,CFG["TP2"])
-                self.setups.append(Setup("W5", imp.direction, t5, tf5, z5, p2.price, tp1_5, tp2_5, dict(src="impulse")))
+                self.setups.append(Setup("W5", imp.direction, t5, tf5, z5, p2.price, tp1_5, tp2_5, dict(src="impulse", confirm_delay=setup_confirm_idx_w5 - p4.idx)))
         for abc in self.abcs:
             a0,a1,b1,c1 = abc.points
+            # ABC setup: needs b1 (the correction low/high) confirmed
+            setup_confirm_idx = max(b1.confirm_idx if b1.confirm_idx >= 0 else b1.idx + 1, 0)
+            if setup_confirm_idx >= len(self.h1):
+                continue
             zc=self.h1_engine.fib_zone(a0.price,a1.price,abc.direction,CFG["ENTRY_ZONE_C"])
-            tc=self.h1.iloc[b1.idx+1]["date"]; tfc=self._preferred_tf(tc)
+            tc=self.h1.iloc[setup_confirm_idx]["date"]; tfc=self._preferred_tf(tc)
             tp1_c=self.h1_engine.fib_ext(a0.price,a1.price,abc.direction,CFG["TP1"])
             tp2_c=self.h1_engine.fib_ext(a0.price,a1.price,abc.direction,CFG["TP2"])
-            self.setups.append(Setup("C", abc.direction, tc, tfc, zc, b1.price, tp1_c, tp2_c, dict(src="abc")))
+            self.setups.append(Setup("C", abc.direction, tc, tfc, zc, b1.price, tp1_c, tp2_c, dict(src="abc", confirm_delay=setup_confirm_idx - b1.idx)))
         self.setups.sort(key=lambda s:s.start_time)
         self.telemetry["setups"]=len(self.setups)
 
@@ -1494,7 +1695,7 @@ class Backtester:
         self.sim_trades.clear()
         for sp in self.setups:
             # Regime-Filter (ADX) als erstes Gate
-            if CFG.get("USE_ADX", True):
+            if CFG.get("USE_ADX", False):
                 try:
                     didx=self.daily[self.daily["date"]<=pd.Timestamp(sp.start_time)].index
                     if len(didx)>0 and "ADX_14" in self.daily.columns:
@@ -1512,6 +1713,42 @@ class Backtester:
                 self.telemetry["filtered_ema"]+=1; continue
             if not vol_ok(df.loc[start_i]):
                 self.telemetry["filtered_vol"]+=1; continue
+            
+            # Volatility Regime Filter (filter high/low vola phases)
+            vola_min_pct = CFG.get("VOLA_FILTER_MIN", 0)  # min ATR percentile (0-100)
+            vola_max_pct = CFG.get("VOLA_FILTER_MAX", 100)  # max ATR percentile (0-100)
+            if vola_min_pct > 0 or vola_max_pct < 100:
+                try:
+                    entry_date = pd.Timestamp(sp.start_time).normalize()
+                    didx = self.daily[self.daily["date"] <= entry_date].index
+                    if len(didx) > 60:
+                        current_atr = float(self.daily.loc[didx.max(), "ATR_PCT"])
+                        lookback = 60
+                        start_idx = max(0, didx.max() - lookback)
+                        historical_atr = self.daily["ATR_PCT"].iloc[start_idx:didx.max()+1].dropna()
+                        if len(historical_atr) >= 10:
+                            percentile = (historical_atr < current_atr).sum() / len(historical_atr) * 100
+                            if percentile < vola_min_pct or percentile > vola_max_pct:
+                                self.telemetry["filtered_vola_regime"] = self.telemetry.get("filtered_vola_regime", 0) + 1
+                                continue
+                except Exception:
+                    pass
+            
+            # Momentum Filter (like live system)
+            if CFG.get("USE_MOMENTUM_FILTER", False):
+                mom_period = CFG.get("MOMENTUM_PERIOD", 14)
+                mom_threshold = CFG.get("MOMENTUM_THRESHOLD", 0.0)
+                if start_i >= mom_period:
+                    price_now = float(df.iloc[start_i]["close"])
+                    price_past = float(df.iloc[start_i - mom_period]["close"])
+                    momentum = (price_now - price_past) / max(price_past, 1e-9)
+                    # LONG: momentum sollte positiv sein, SHORT: negativ
+                    if sp.direction == Dir.UP and momentum < mom_threshold:
+                        self.telemetry["filtered_momentum"] = self.telemetry.get("filtered_momentum", 0) + 1
+                        continue
+                    elif sp.direction == Dir.DOWN and momentum > -mom_threshold:
+                        self.telemetry["filtered_momentum"] = self.telemetry.get("filtered_momentum", 0) + 1
+                        continue
 
             win = CFG["ENTRY_WINDOW_M30"] if sp.entry_tf=="30m" else CFG["ENTRY_WINDOW_H1"]
             t_idx = first_touch(df, sp.start_time, sp.zone, win)
@@ -1526,10 +1763,33 @@ class Backtester:
             stop = sp.stop_ref - buffer if sp.direction==Dir.UP else sp.stop_ref + buffer
             entry=float(df.iloc[e_idx]["close"])
             rps=abs(entry-stop)
+            
+            # Minimum stop distance: at least 0.3% of entry price (prevents absurd position sizes)
+            min_stop_pct = CFG.get("MIN_STOP_PCT", 0.003)  # 0.3% default
+            min_rps = entry * min_stop_pct
+            if rps < min_rps:
+                # Adjust stop to minimum distance
+                if sp.direction == Dir.UP:
+                    stop = entry - min_rps
+                else:
+                    stop = entry + min_rps
+                rps = min_rps
+            
             if rps<=1e-9: continue
 
             max_hold=CFG["MAX_HOLD_M30"] if sp.entry_tf=="30m" else CFG["MAX_HOLD_H1"]
-            x_idx,x_price,ps,mae,mfe = simulate(df, e_idx, entry, sp.direction, stop, sp.tp1, sp.tp2, max_hold)
+            
+            # Momentum Exit: use H1 as higher TF for M30 entries, Daily for H1 entries
+            mom_exit_bars = CFG.get("MOMENTUM_EXIT_BARS", 0)
+            mom_period = CFG.get("MOMENTUM_PERIOD", 14)
+            if mom_exit_bars > 0:
+                # Higher TF: H1 for M30 entries, Daily for H1 entries
+                higher_tf_df = self.h1 if sp.entry_tf == "30m" else self.daily
+                x_idx,x_price,ps,mae,mfe = simulate(df, e_idx, entry, sp.direction, stop, sp.tp1, sp.tp2, max_hold,
+                                                     higher_tf_df=higher_tf_df, mom_exit_bars=mom_exit_bars, mom_period=mom_period)
+            else:
+                x_idx,x_price,ps,mae,mfe = simulate(df, e_idx, entry, sp.direction, stop, sp.tp1, sp.tp2, max_hold)
+            
             feats = build_features(df, e_idx, sp.direction, sp.setup, sp.zone)
             label = 1 if ps>0 else 0
 
@@ -1798,8 +2058,53 @@ class Backtester:
                 frac=max(0.0,(prob-base_thr)/max(1e-6,1-base_thr))
                 scale=CFG.get("PROB_SIZE_MIN",1.0)+(CFG.get("PROB_SIZE_MAX",1.0)-CFG.get("PROB_SIZE_MIN",1.0))*frac
                 size*=scale
+            
+            # Volatility forecast-based position sizing (walk-forward, no lookahead)
+            vola_mult = 1.0
+            if self.vola_forecast_ready and self.vola_forecaster is not None:
+                try:
+                    # Find daily bar index for this trade's entry time
+                    daily_mask = self.daily['date'] <= sim.time_in
+                    if daily_mask.any():
+                        daily_idx = daily_mask.sum() - 1  # last bar before/at entry
+                        window = CFG.get('VOLA_FORECAST_WINDOW', 252)
+                        if daily_idx >= window:
+                            # Get volatility forecast and size multiplier
+                            vola_result = self.vola_forecaster.forecast_volatility(
+                                self.daily, daily_idx
+                            )
+                            if vola_result and 'size_multiplier' in vola_result:
+                                vola_mult = vola_result['size_multiplier']
+                                self.telemetry['vola_sized'] += 1
+                except Exception as e:
+                    if self.telemetry['vola_sized'] == 0:  # Only log first error
+                        print(f"[VOLA] Forecast error: {e}")
+            size *= vola_mult
+            
+            # Cap position size: max notional = 100% of current capital (no leverage beyond 1x)
+            max_exposure_pct = CFG.get("MAX_POSITION_EXPOSURE", 1.0)  # 1.0 = 100% of account
+            max_size = (cap * max_exposure_pct) / max(sim.entry, 1e-9)
+            size = min(size, max_size)
+            
             size=int(max(1,size))
-            pnl = (sim.per_share * size)
+            pnl = float(sim.per_share * size)
+            
+            # Apply trading costs (fee + slippage) - realistic execution costs
+            # Fee: percentage of trade notional (entry_price × shares)
+            # Slippage: additional execution cost as percentage of entry price
+            # Typical values: fee=0.0001 (1 bps), slippage=0.0005 (5 bps)
+            fee_rate = float(CFG.get('FEE', 0.0) or 0.0)
+            slip_rate = float(CFG.get('SLIPPAGE', 0.0) or 0.0)
+            trade_notional = float(sim.entry) * float(size)  # position value
+            if fee_rate > 0:
+                # Fee as % of notional, round-trip (entry + exit)
+                fee_cost = trade_notional * fee_rate * 2
+                pnl -= fee_cost
+            if slip_rate > 0:
+                # Slippage as % of entry price, applied to position
+                slip_cost = trade_notional * slip_rate * 2  # round-trip
+                pnl -= slip_cost
+            
             # FTMO payout split: only a fraction of profits are retained, losses full
             split = float(CFG.get('FTMO_SPLIT', 1.0))
             if split < 0.9999 and pnl > 0:
@@ -1844,15 +2149,29 @@ class Backtester:
         if not self.sim_trades: return {}
         times=sorted([t.time_in for t in self.sim_trades])
         split_idx=max(1, int(len(times)*CFG["TRAIN_FRAC"]))
-        train_until=times[split_idx-1]
+        # Purging gap: skip trades between train and test to avoid leakage
+        purge_bars = CFG.get('TRAIN_TEST_PURGE_BARS', 0)
+        if purge_bars > 0 and split_idx + purge_bars < len(times):
+            train_until = times[split_idx - 1]
+            # Adjust OOS start to skip purge window
+            oos_start_idx = split_idx + purge_bars
+            self._purged_oos_start = times[oos_start_idx] if oos_start_idx < len(times) else train_until
+        else:
+            train_until = times[split_idx - 1]
+            self._purged_oos_start = train_until
         # Speichern für spätere Re-Simulationen (Deep Rerun)
         self.train_until = train_until
 
         if CFG["USE_ML"]:
+            # Apply purging: training trades before purge window only
+            purge_start = getattr(self, '_purged_oos_start', train_until)
             train=[t for t in self.sim_trades if t.time_in<=train_until]
             if len(train)>=20:
                 self.train_model(train)
-                if CFG.get("OPTIMIZE_ML_THRESHOLD", False) and self.model is not None:
+                # In neutral mode, use fixed threshold from training (no OOS optimization)
+                if CFG.get('NEUTRAL_MODE', False):
+                    print(f"[NEUTRAL] Fester ML-Threshold: {self.threshold:.3f} (aus Training)")
+                elif CFG.get("OPTIMIZE_ML_THRESHOLD", False) and self.model is not None:
                     try:
                         val=[t for t in self.sim_trades if t.time_in>train_until]
                         if len(val)>=25:
@@ -1872,10 +2191,10 @@ class Backtester:
                             self.threshold=float(best_thr)
                     except Exception:
                         pass
-                try:
-                    self.optimize_threshold_and_risk(train_until)
-                except Exception as e:
-                    print(f"[WARN] Ziel-Optimierung fehlgeschlagen: {e}")
+                    try:
+                        self.optimize_threshold_and_risk(train_until)
+                    except Exception as e:
+                        print(f"[WARN] Ziel-Optimierung fehlgeschlagen: {e}")
             else:
                 self.model=None; self.threshold=0.5; self.ml_train_pass_rate=None
         else:
@@ -1897,10 +2216,106 @@ class Backtester:
         metrics=self.metrics()
         print("\n--- Telemetrie ---")
         print(f"Setups gesamt: {self.telemetry['setups']} | akzeptiert bis Entry: {self.telemetry['accepted']}")
-        print(f"Filter: daily={self.telemetry.get('filtered_daily',0)}, regime(ADX)={self.telemetry.get('filtered_regime',0)}, ema={self.telemetry['filtered_ema']}, vol={self.telemetry['filtered_vol']}, no_touch={self.telemetry['no_touch']}, no_confirm={self.telemetry['no_confirm']}")
+        print(f"Filter: daily={self.telemetry.get('filtered_daily',0)}, regime(ADX)={self.telemetry.get('filtered_regime',0)}, vola_regime={self.telemetry.get('filtered_vola_regime',0)}, ema={self.telemetry['filtered_ema']}, vol={self.telemetry['filtered_vol']}, momentum={self.telemetry.get('filtered_momentum',0)}, no_touch={self.telemetry['no_touch']}, no_confirm={self.telemetry['no_confirm']}")
+        if self.telemetry.get('vola_sized', 0) > 0:
+            print(f"[VOLA-SIZING] {self.telemetry['vola_sized']} Trades mit Vola-Forecast angepasst")
         if CFG["USE_ML"]:
             print(f"ML threshold: {self.threshold:.3f} | Train pass-rate: {self.ml_train_pass_rate} | Test pass-rate used: {self.ml_test_pass_rate}")
+        
+        # Regime Analysis (by ADX levels)
+        if CFG.get("ANALYZE_REGIMES", False):
+            self._analyze_regimes()
+        
         return metrics
+
+    # ---------- Regime Analysis ----------
+    def _analyze_regimes(self):
+        """Analyze performance by VOLATILITY regime (ATR-based)"""
+        if not self.trades:
+            print("\n[REGIME] Keine Trades verfügbar")
+            return
+        
+        # Calculate ATR percentile at entry for each trade
+        # Use daily ATR_PCT for regime classification
+        if "ATR_PCT" not in self.daily.columns:
+            print("\n[REGIME] Keine ATR-Daten verfügbar")
+            return
+        
+        # Calculate rolling ATR percentile (where does current ATR stand vs last 60 days)
+        atr_series = self.daily["ATR_PCT"].dropna()
+        
+        # Bucket trades by volatility regime
+        regimes = {
+            "low_vola (<25%)": [],      # Bottom quartile - stagnation
+            "mid_vola (25-75%)": [],    # Middle 50%
+            "high_vola (>75%)": [],     # Top quartile - high volatility
+        }
+        
+        for t in self.trades:
+            # Find ATR at trade entry
+            entry_date = pd.Timestamp(t.time_in).normalize()
+            didx = self.daily[self.daily["date"] <= entry_date].index
+            if len(didx) == 0:
+                continue
+            
+            current_atr = float(self.daily.loc[didx.max(), "ATR_PCT"])
+            if np.isnan(current_atr):
+                continue
+            
+            # Calculate percentile vs last 60 days
+            lookback = 60
+            start_idx = max(0, didx.max() - lookback)
+            historical_atr = atr_series.iloc[start_idx:didx.max()+1]
+            if len(historical_atr) < 10:
+                continue
+            
+            percentile = (historical_atr < current_atr).sum() / len(historical_atr) * 100
+            
+            if percentile < 25:
+                regimes["low_vola (<25%)"].append(t)
+            elif percentile < 75:
+                regimes["mid_vola (25-75%)"].append(t)
+            else:
+                regimes["high_vola (>75%)"].append(t)
+        
+        print("\n--- Regime-Analyse (nach Volatilität) ---")
+        print(f"{'Regime':<20} {'Trades':>8} {'Winrate':>10} {'Avg PnL':>12} {'Total PnL':>14} {'PF':>8}")
+        print("-" * 75)
+        
+        for regime, trades in regimes.items():
+            if not trades:
+                print(f"{regime:<20} {'---':>8}")
+                continue
+            
+            pnls = [t.pnl for t in trades]
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p <= 0]
+            
+            n = len(trades)
+            winrate = len(wins) / n * 100 if n else 0
+            avg_pnl = np.mean(pnls) if pnls else 0
+            total_pnl = sum(pnls)
+            pf = sum(wins) / abs(sum(losses)) if losses and sum(losses) != 0 else float('inf')
+            
+            print(f"{regime:<20} {n:>8} {winrate:>9.1f}% ${avg_pnl:>10.2f} ${total_pnl:>12.2f} {pf:>8.2f}")
+        
+        print("-" * 75)
+        
+        # Recommendation
+        low_trades = regimes["low_vola (<25%)"]
+        high_trades = regimes["high_vola (>75%)"]
+        if low_trades and high_trades:
+            low_pnls = [t.pnl for t in low_trades]
+            low_avg = np.mean(low_pnls)
+            high_pnls = [t.pnl for t in high_trades]
+            high_avg = np.mean(high_pnls)
+            
+            if low_avg < 0 and high_avg > 0:
+                print(f"[EMPFEHLUNG] System performt besser bei hoher Volatilität. Filtere Low-Vola Phasen!")
+            elif high_avg < low_avg:
+                print(f"[INFO] System performt überraschenderweise besser bei niedriger Vola.")
+            else:
+                print(f"[INFO] Beide Regimes profitabel - Moderate Unterschiede.")
 
     # ---------- Metrics ----------
     def metrics(self)->Dict:
@@ -1912,32 +2327,91 @@ class Backtester:
 
         eq=pd.DataFrame(self.equity)
         eq["date"]=pd.to_datetime(eq["date"])
-        eq["ret"]=eq["capital"].pct_change().fillna(0.0)  # dezimal
-        rets=eq["ret"].values
-
-        span_years=max((eq["date"].iloc[-1]-eq["date"].iloc[0]).days/365.0, 1e-6)
-        periods_per_year = len(rets)/span_years if span_years>0 else 0.0
-
-        mu = float(np.mean(rets)) if len(rets) else 0.0
-        sigma = float(np.std(rets, ddof=1)) if len(rets)>1 else 0.0
-        rf_ann = RISK_FREE_RATE/100.0
-        rf_per_period = (1.0 + rf_ann)**(1.0/max(periods_per_year,1e-6)) - 1.0 if periods_per_year>0 else 0.0
-
-        vol_annual = sigma*math.sqrt(max(periods_per_year,1e-6))
-        vol_pct = vol_annual*100.0
-
-        sharpe = ((mu - rf_per_period)/sigma)*math.sqrt(periods_per_year) if sigma>1e-12 and periods_per_year>0 else 0.0
-
-        downside_arr = np.minimum(rets - rf_per_period, 0.0)
-        down_sigma = float(np.std(downside_arr, ddof=1)) if len(downside_arr)>1 and np.any(downside_arr<0) else 0.0
-        sortino = ((mu - rf_per_period)/down_sigma)*math.sqrt(periods_per_year) if down_sigma>1e-12 and periods_per_year>0 else 0.0
+        
+        # ========== KORRIGIERTE SHARPE/SORTINO BERECHNUNG ==========
+        # Problem: Equity wird nur bei Trades aktualisiert, nicht täglich
+        # Lösung: Berechne Volatilität nur aus Tagen MIT Trades, aber annualisiere korrekt
+        
+        # Methode 1: Tägliche Returns (mit Forward-Fill für korrekte Zeitbasis)
+        eq_daily = eq.set_index("date").resample("D").last().ffill()
+        eq_daily = eq_daily.dropna(subset=["capital"])
+        
+        # Log-Renditen berechnen
+        eq_daily["log_ret"] = np.log(eq_daily["capital"] / eq_daily["capital"].shift(1))
+        eq_daily["log_ret"] = eq_daily["log_ret"].fillna(0.0)
+        log_rets_all = eq_daily["log_ret"].values
+        
+        # Nur Tage mit tatsächlichen Änderungen (Trades) für Volatilitätsberechnung
+        # Dies ist realistischer, da die Strategie nicht täglich exponiert ist
+        log_rets_nonzero = log_rets_all[np.abs(log_rets_all) > 1e-10]
+        
+        # Annualisierungsfaktor
+        trading_days_per_year = 252
+        actual_days = (eq_daily.index[-1] - eq_daily.index[0]).days
+        years_actual = actual_days / 365.0 if actual_days > 0 else 1.0
+        
+        # Exposure: Anteil der Zeit im Markt
+        trades_per_year = len(self.trades) / years_actual if years_actual > 0 else 0
+        exposure_days = len(log_rets_nonzero)
+        exposure_ratio = exposure_days / len(log_rets_all) if len(log_rets_all) > 0 else 0
+        
+        # Tägliche Statistiken (aus Tagen MIT Trades)
+        mu_trade_day = float(np.mean(log_rets_nonzero)) if len(log_rets_nonzero) > 1 else 0.0
+        sigma_trade_day = float(np.std(log_rets_nonzero, ddof=1)) if len(log_rets_nonzero) > 1 else 0.0
+        
+        # Annualisierte Volatilität
+        # Skaliere mit sqrt(trades_per_year) für realistischere Vol
+        # Alternativ: sqrt(exposure_days / years_actual) für Trade-Frequenz-adjustiert
+        annualization_factor = math.sqrt(len(log_rets_nonzero) / years_actual) if years_actual > 0 else 1.0
+        vol_annual = sigma_trade_day * annualization_factor
+        vol_pct = vol_annual * 100.0
+        
+        # Risk-free rate
+        rf_ann = RISK_FREE_RATE / 100.0
+        rf_daily = rf_ann / trading_days_per_year
+        mu_annual = mu_trade_day * (len(log_rets_nonzero) / years_actual) if years_actual > 0 else 0.0
+        
+        # CAGR für Sharpe (aus tatsächlicher Equity-Entwicklung)
+        if end > 0 and start > 0 and years_actual > 0:
+            cagr_for_sharpe = (end / start) ** (1 / years_actual) - 1
+        else:
+            cagr_for_sharpe = 0.0
+        
+        # Sharpe Ratio
+        sharpe = (cagr_for_sharpe - rf_ann) / vol_annual if vol_annual > 1e-12 else 0.0
+        
+        # Sortino Ratio (nur Downside-Volatilität)
+        downside_rets = np.minimum(log_rets_nonzero, 0.0)
+        down_sigma_trade = float(np.std(downside_rets, ddof=1)) if len(downside_rets) > 1 and np.any(downside_rets < 0) else 0.0
+        down_sigma_annual = down_sigma_trade * annualization_factor
+        sortino = (cagr_for_sharpe - rf_ann) / down_sigma_annual if down_sigma_annual > 1e-12 else 0.0
+        
+        # Debug: Zeige Sharpe-Komponenten bei erster Berechnung
+        if not hasattr(self, '_sharpe_debug_shown'):
+            self._sharpe_debug_shown = True
+            print(f"[SHARPE] Years: {years_actual:.2f} | Trade-days: {len(log_rets_nonzero)} | Exposure: {exposure_ratio*100:.1f}%")
+            print(f"[SHARPE] sigma_per_trade: {sigma_trade_day*100:.3f}% | vol_annual: {vol_pct:.2f}%")
+            print(f"[SHARPE] CAGR: {cagr_for_sharpe*100:.2f}% | Sharpe: {sharpe:.2f} | Sortino: {sortino:.2f}")
+        
+        # Legacy: einfache Renditen für Kompatibilität
+        eq["ret"] = eq["capital"].pct_change().fillna(0.0)
+        rets = eq["ret"].values
+        span_years = max((eq["date"].iloc[-1] - eq["date"].iloc[0]).days / 365.0, 1e-6)
+        periods_per_year = len(rets) / span_years if span_years > 0 else 0.0
+        rf_per_period = rf_daily  # für Kompatibilität mit altem Code
 
         years = max((pd.Timestamp(self.equity[-1]["date"]) - pd.Timestamp(self.equity[0]["date"])).days / 365.0, 1e-6)
         try:
-            cagr = ((end/start)**(1/years)-1)*100 if start>0 else 0.0
-            if not np.isfinite(cagr) or cagr > 1e6 or cagr < -1e6:
+            ratio = end/start if start > 0 else 0.0
+            # Avoid complex numbers from negative base exponentiation
+            if ratio <= 0:
+                cagr = -100.0  # Total loss or worse
+            else:
+                cagr = (ratio**(1/years)-1)*100
+            # Sanity check
+            if not isinstance(cagr, (int, float)) or not np.isfinite(cagr) or cagr > 1e6 or cagr < -1e6:
                 cagr = 0.0
-        except (OverflowError, ZeroDivisionError, ValueError):
+        except (OverflowError, ZeroDivisionError, ValueError, TypeError):
             cagr = 0.0
 
         max_dd=min(e["dd"] for e in self.equity) if self.equity else 0.0  # in %
@@ -2544,13 +3018,62 @@ def main():
         if getattr(args,'no_ema_trend',False): base['USE_EMA_TREND']=False
         if getattr(args,'no_daily_ema',False): base['USE_DAILY_EMA']=False
         if getattr(args,'no_adx',False): base['USE_ADX']=False
+        if getattr(args,'use_adx',False): base['USE_ADX']=True
+        if getattr(args,'adx_threshold',None): base['ADX_TREND_THRESHOLD']=args.adx_threshold
+        base['ANALYZE_REGIMES'] = getattr(args,'analyze_regimes',False)
+        # Volatility Regime Filter
+        base['VOLA_FILTER_MIN'] = getattr(args,'vola_min',0)
+        base['VOLA_FILTER_MAX'] = getattr(args,'vola_max',100)
+        # Volatility Forecast Sizing
+        base['USE_VOLA_FORECAST'] = getattr(args,'vola_forecast',False) and VOLA_FORECAST_AVAILABLE
+        base['VOLA_FORECAST_WINDOW'] = getattr(args,'vola_forecast_window',252)
+        if getattr(args,'vola_forecast',False) and not VOLA_FORECAST_AVAILABLE:
+            print("[WARN] --vola-forecast requested but volatility_backtest.py not available")
+        # Local data path
+        base['LOCAL_DATA_PATH'] = getattr(args,'local_data',None)
         if getattr(args,'no_confirm',False): base['REQUIRE_CONFIRM']=False
         base['DEEP_CF']=getattr(args,'deep_counterfactuals',False)
         base['FULL_GRID_CF']=getattr(args,'full_grid_cf',False)
         for k,v in [('APPLY_THRESHOLD_SHIFT',0.0),('THR_OFFSET_W3',0.0),('THR_OFFSET_C',0.0),('THR_OFFSET_W5',0.0),('THR_OFFSET_OTHER',0.0)]:
             base.setdefault(k,v)
+        # --- NEUTRAL MODE: disable overfitting-prone features ---
+        if getattr(args, 'neutral', False):
+            base['OPTIMIZE_ML_THRESHOLD'] = False      # no OOS threshold search
+            base['AUTO_RISK_SCALE'] = False            # no dynamic risk scaling
+            base['DYNAMIC_DD_RISK'] = False            # no DD-based risk reduction
+            base['USE_VOL_TARGET'] = False             # no vol-target sizing
+            base['SIZE_BY_PROB'] = False               # no probability-based sizing
+            base['APPLY_THRESHOLD_SHIFT'] = 0.0        # no manual threshold shift
+            base['THR_OFFSET_W3'] = 0.0                # no setup-specific offsets
+            base['THR_OFFSET_C'] = 0.0
+            base['THR_OFFSET_W5'] = 0.0
+            base['THR_OFFSET_OTHER'] = 0.0
+            base['TRAIN_TEST_PURGE_BARS'] = 20         # gap between train/test
+            base['NEUTRAL_MODE'] = True
+            print("[NEUTRAL] Backtest läuft ohne Optimierungen (fester Threshold, fixes Risiko, keine Offsets)")
+        else:
+            base['NEUTRAL_MODE'] = False
+            base['TRAIN_TEST_PURGE_BARS'] = 0
+        
+        # --- MOMENTUM FILTER ---
+        if getattr(args, 'momentum', False):
+            base['USE_MOMENTUM_FILTER'] = True
+            base['MOMENTUM_PERIOD'] = getattr(args, 'momentum_period', 14)
+            base['MOMENTUM_THRESHOLD'] = getattr(args, 'momentum_threshold', 0.0)
+            print(f"[MOMENTUM] Filter aktiv: Periode={base['MOMENTUM_PERIOD']}, Threshold={base['MOMENTUM_THRESHOLD']:.4f}")
+        else:
+            base['USE_MOMENTUM_FILTER'] = False
+        
+        # --- MOMENTUM EXIT (early exit when momentum weakens) ---
+        mom_exit_bars = getattr(args, 'momentum_exit', 0)
+        base['MOMENTUM_EXIT_BARS'] = mom_exit_bars
+        if mom_exit_bars > 0:
+            base['MOMENTUM_PERIOD'] = getattr(args, 'momentum_period', 14)
+            print(f"[MOMENTUM-EXIT] Aktiv: Exit nach {mom_exit_bars} abnehmenden Bars (Periode={base['MOMENTUM_PERIOD']})")
+        
         CFG=base
-        _apply_manual_offsets(CFG,args)
+        if not getattr(args, 'neutral', False):
+            _apply_manual_offsets(CFG,args)
         print(f"[START] Profil={CFG['_PROFILE']} Symbol={sym} StartCap={CFG['START_CAPITAL']:.2f} ML={CFG.get('USE_ML')} Shift={CFG.get('APPLY_THRESHOLD_SHIFT',0.0):+0.2f}")
         try:
             daily,h1,m30 = load_data()
@@ -2627,6 +3150,8 @@ def main():
                 print(f"Report Fehler: {e}")
             print(f"CSV: {out_csv} | PDF: {out_pdf}")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"[ERROR] Symbol {sym}: {e}")
 
     # Portfolio Report

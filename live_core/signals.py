@@ -372,36 +372,23 @@ class SignalEngine:
         self.primary_engine = ElliottEngine(cfg.primary_zz_pct, cfg.primary_zz_atr_mult, cfg.primary_min_imp_atr)
         self.h1_engine = ElliottEngine(cfg.h1_zz_pct, cfg.h1_zz_atr_mult, cfg.h1_min_imp_atr)
         self.ml_provider = ml_provider
-        self._daily_ema_df: Optional[pd.DataFrame] = None
+        self._daily_df: Optional[pd.DataFrame] = None
 
     def preprocess(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
-            self._daily_ema_df = None
             return df
-        processed = add_indicators(df, self.cfg)
-        self._daily_ema_df = self._build_daily_ema(processed)
-        return processed
-
-    def _build_daily_ema(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        if not self.cfg.use_daily_ema or df.empty or "date" not in df.columns:
-            return None
-        daily_close = (
-            df.set_index("date")["close"].resample("1D").last().dropna().to_frame()
-        )
-        if daily_close.empty:
-            return None
-        daily = daily_close.copy()
-        daily["EMA_FAST"] = daily["close"].ewm(span=self.cfg.ema_fast, adjust=False).mean()
-        daily["EMA_SLOW"] = daily["close"].ewm(span=self.cfg.ema_slow, adjust=False).mean()
-        return daily.reset_index()
+        return add_indicators(df, self.cfg)
 
     def _daily_trend_ok(self, timestamp: pd.Timestamp, direction: Dir) -> bool:
-        if not self.cfg.use_daily_ema or self._daily_ema_df is None:
+        if not self.cfg.use_daily_ema or self._daily_df is None or self._daily_df.empty:
             return True
-        mask = self._daily_ema_df["date"] <= pd.to_datetime(timestamp)
+        daily = self._daily_df
+        if "date" not in daily.columns:
+            return True
+        mask = daily["date"] <= pd.to_datetime(timestamp)
         if not mask.any():
             return True
-        row = self._daily_ema_df.loc[mask].iloc[-1]
+        row = daily.loc[mask].iloc[-1]
         fast = _to_float(row.get("EMA_FAST"))
         slow = _to_float(row.get("EMA_SLOW"))
         if fast is None or slow is None or np.isnan(fast) or np.isnan(slow):
@@ -410,13 +397,50 @@ class SignalEngine:
             return fast > slow
         return fast < slow
 
-    def build_signals(self, df: pd.DataFrame, symbol: str) -> List[EntrySignal]:
-        if df.empty:
+    def _preferred_tf(self, m30_df: pd.DataFrame, start_time: pd.Timestamp) -> str:
+        """Backtest parity: prefer M30 if data range covers the setup start time."""
+        try:
+            if not m30_df.empty and "date" in m30_df.columns:
+                first = pd.to_datetime(m30_df["date"].iloc[0])
+                last = pd.to_datetime(m30_df["date"].iloc[-1])
+                if first <= pd.to_datetime(start_time) <= last:
+                    return "M30"
+        except Exception:
+            pass
+        return "H1"
+
+    @staticmethod
+    def _df_for_tf(h1_df: pd.DataFrame, m30_df: pd.DataFrame, tf: str) -> pd.DataFrame:
+        return m30_df if (tf or "").upper() in {"M30", "30M", "30"} else h1_df
+
+    def build_signals_topdown(
+        self,
+        *,
+        daily_df: pd.DataFrame,
+        h1_df: pd.DataFrame,
+        m30_df: pd.DataFrame,
+        symbol: str,
+    ) -> List[EntrySignal]:
+        """Backtest-parity signal generation.
+
+        - Structure is computed on H1 (impulses + ABC)
+        - Daily is used for daily EMA trend and optional ADX regime gate
+        - Entry evaluation happens on preferred TF (M30 if available else H1)
+        - Setup start_time aligns with Backtester (pivot_idx + 1 bar)
+        """
+        if h1_df is None or h1_df.empty:
+            self._daily_df = None
             return []
-        setups = self._build_setups(df)
+
+        daily_proc = self.preprocess(daily_df) if daily_df is not None else pd.DataFrame()
+        h1_proc = self.preprocess(h1_df)
+        m30_proc = self.preprocess(m30_df) if m30_df is not None else pd.DataFrame()
+        self._daily_df = daily_proc
+
+        setups = self._build_setups_topdown(h1_proc, m30_proc)
         signals: List[EntrySignal] = []
         for setup in setups:
-            sig = self._evaluate_setup(df, setup)
+            sig = self._evaluate_setup_topdown(daily_proc, h1_proc, m30_proc, setup)
             if sig:
                 ml_prob = self._apply_ml_probability(symbol, sig)
                 if ml_prob is not None:
@@ -424,65 +448,103 @@ class SignalEngine:
                 signals.append(sig)
         return signals
 
-    def _build_setups(self, df: pd.DataFrame) -> List[Setup]:
-        pivots = self.h1_engine.zigzag(df["close"].astype(float).values, df.get("ATR", df["close"]).astype(float).values)
-        impulses = self.h1_engine.detect_impulses(pivots, df["close"].astype(float).values, df.get("ATR", df["close"]).astype(float).values)
+    def build_signals(self, df: pd.DataFrame, symbol: str) -> List[EntrySignal]:
+        # Legacy single-stream mode: treat df as H1 and run without Daily/M30 gates.
+        if df.empty:
+            return []
+        return self.build_signals_topdown(daily_df=pd.DataFrame(), h1_df=df, m30_df=pd.DataFrame(), symbol=symbol)
+
+    def _build_setups_topdown(self, h1_df: pd.DataFrame, m30_df: pd.DataFrame) -> List[Setup]:
+        pivots = self.h1_engine.zigzag(
+            h1_df["close"].astype(float).values,
+            h1_df.get("ATR", h1_df["close"]).astype(float).values,
+        )
+        impulses = self.h1_engine.detect_impulses(
+            pivots,
+            h1_df["close"].astype(float).values,
+            h1_df.get("ATR", h1_df["close"]).astype(float).values,
+        )
         abcs = self.h1_engine.detect_abcs(pivots)
         setups: List[Setup] = []
         for impulse in impulses:
             p0, p1, p2, p3, p4, _p5 = impulse.points
-            idx_entry = _bounded_index(p2.idx, len(df) - 1)
-            entry_time = df.iloc[idx_entry]["date"]
+            # Backtest parity: use pivot index + 1 bar
+            idx_entry = p2.idx + 1
+            if idx_entry <= 0 or idx_entry >= len(h1_df):
+                continue
+            entry_time = h1_df.iloc[idx_entry]["date"]
+            entry_tf = self._preferred_tf(m30_df, pd.to_datetime(entry_time))
             if impulse.direction == Dir.UP:
                 zone = self.h1_engine.fib_zone(p0.price, p1.price, Dir.UP, self.cfg.entry_zone_w3)
                 tp1 = self.h1_engine.fib_ext(p0.price, p1.price, Dir.UP, self.cfg.tp1)
                 tp2 = self.h1_engine.fib_ext(p0.price, p1.price, Dir.UP, self.cfg.tp2)
-                setups.append(Setup("W3", Dir.UP, entry_time, idx_entry, zone, p0.price, tp1, tp2))
+                setups.append(Setup("W3", Dir.UP, pd.to_datetime(entry_time), idx_entry, zone, p0.price, tp1, tp2, entry_tf=entry_tf))
             else:
                 zone = self.h1_engine.fib_zone(p0.price, p1.price, Dir.DOWN, self.cfg.entry_zone_w3)
                 tp1 = self.h1_engine.fib_ext(p0.price, p1.price, Dir.DOWN, self.cfg.tp1)
                 tp2 = self.h1_engine.fib_ext(p0.price, p1.price, Dir.DOWN, self.cfg.tp2)
-                setups.append(Setup("W3", Dir.DOWN, entry_time, idx_entry, zone, p0.price, tp1, tp2))
+                setups.append(Setup("W3", Dir.DOWN, pd.to_datetime(entry_time), idx_entry, zone, p0.price, tp1, tp2, entry_tf=entry_tf))
             if self.cfg.use_w5:
-                idx_w5 = _bounded_index(p4.idx, len(df) - 1)
-                entry_time_w5 = df.iloc[idx_w5]["date"]
+                idx_w5 = p4.idx + 1
+                if idx_w5 <= 0 or idx_w5 >= len(h1_df):
+                    continue
+                entry_time_w5 = h1_df.iloc[idx_w5]["date"]
+                entry_tf_w5 = self._preferred_tf(m30_df, pd.to_datetime(entry_time_w5))
                 zone = self.h1_engine.fib_zone(p2.price, p3.price, impulse.direction, self.cfg.entry_zone_w5)
                 tp1 = self.h1_engine.fib_ext(p2.price, p3.price, impulse.direction, self.cfg.tp1)
                 tp2 = self.h1_engine.fib_ext(p2.price, p3.price, impulse.direction, self.cfg.tp2)
-                setups.append(Setup("W5", impulse.direction, entry_time_w5, idx_w5, zone, p2.price, tp1, tp2))
+                setups.append(Setup("W5", impulse.direction, pd.to_datetime(entry_time_w5), idx_w5, zone, p2.price, tp1, tp2, entry_tf=entry_tf_w5))
         for abc in abcs:
             a0, a1, b1, c1 = abc.points
-            idx_entry = _bounded_index(b1.idx, len(df) - 1)
-            entry_time = df.iloc[idx_entry]["date"]
+            idx_entry = b1.idx + 1
+            if idx_entry <= 0 or idx_entry >= len(h1_df):
+                continue
+            entry_time = h1_df.iloc[idx_entry]["date"]
+            entry_tf = self._preferred_tf(m30_df, pd.to_datetime(entry_time))
             zone = self.h1_engine.fib_zone(a0.price, a1.price, abc.direction, self.cfg.entry_zone_c)
             tp1 = self.h1_engine.fib_ext(a0.price, a1.price, abc.direction, self.cfg.tp1)
             tp2 = self.h1_engine.fib_ext(a0.price, a1.price, abc.direction, self.cfg.tp2)
-            setups.append(Setup("C", abc.direction, entry_time, idx_entry, zone, b1.price, tp1, tp2))
+            setups.append(Setup("C", abc.direction, pd.to_datetime(entry_time), idx_entry, zone, b1.price, tp1, tp2, entry_tf=entry_tf))
         setups.sort(key=lambda s: s.start_time)
         return setups
 
-    def _evaluate_setup(self, df: pd.DataFrame, setup: Setup) -> Optional[EntrySignal]:
+    def _evaluate_setup_topdown(
+        self,
+        daily_df: pd.DataFrame,
+        h1_df: pd.DataFrame,
+        m30_df: pd.DataFrame,
+        setup: Setup,
+    ) -> Optional[EntrySignal]:
+        df = self._df_for_tf(h1_df, m30_df, setup.entry_tf)
+        if df is None or df.empty:
+            return None
+
+        # Backtest parity: optional daily ADX regime filter
+        if self.cfg.use_adx and daily_df is not None and not daily_df.empty and "date" in daily_df.columns:
+            try:
+                mask = daily_df["date"] <= pd.to_datetime(setup.start_time)
+                if mask.any():
+                    row_d = daily_df.loc[mask].iloc[-1]
+                    adx_col = f"ADX_{self.cfg.adx_period}"
+                    adx_value = row_d.get(adx_col)
+                    adx_value = float(adx_value) if adx_value is not None else np.nan
+                    if not np.isnan(adx_value) and adx_value < self.cfg.adx_trend_threshold:
+                        return None
+            except Exception:
+                pass
+
         start_idx = idx_from_time(df, setup.start_time)
         if start_idx is None:
             return None
         row = df.iloc[start_idx]
-        if self.cfg.use_adx and self.cfg.adx_period > 0:
-            adx_col = f"ADX_{self.cfg.adx_period}"
-            adx_value = row.get(adx_col)
-            if adx_value is not None:
-                try:
-                    adx_value = float(adx_value)
-                except (TypeError, ValueError):
-                    adx_value = np.nan
-            if adx_value is not None and not np.isnan(adx_value) and adx_value < self.cfg.adx_trend_threshold:
-                return None
         if not ema_trend_ok(row, setup.direction, self.cfg):
             return None
         if not self._daily_trend_ok(setup.start_time, setup.direction):
             return None
         if not vol_ok(row, self.cfg):
             return None
-        if self.cfg.timeframe.upper() == "30M":
+        entry_tf = (setup.entry_tf or "H1").upper()
+        if entry_tf in {"M30", "30M"}:
             window = self.cfg.entry_window_m30
             bars = self.cfg.confirm_bars_m30
         else:
@@ -496,12 +558,30 @@ class SignalEngine:
             return None
         entry_row = df.iloc[confirm_index]
         atr = float(entry_row.get("ATR", entry_row["close"] * 0.01))
+        entry_price = float(entry_row["close"])
+        
+        # Calculate stop from structure reference with buffer
         buffer = atr * self.cfg.atr_mult_buffer
         if setup.direction == Dir.UP:
             stop = setup.stop_ref - buffer
         else:
             stop = setup.stop_ref + buffer
-        entry_price = float(entry_row["close"])
+        
+        # CRITICAL FIX: Enforce minimum stop distance
+        # The stop must be at least min_stop_atr_mult * ATR away from entry
+        min_atr_dist = atr * getattr(self.cfg, "min_stop_atr_mult", 1.0)
+        # Also enforce minimum percentage distance
+        min_pct_dist = entry_price * getattr(self.cfg, "min_stop_pct", 0.005)
+        min_stop_distance = max(min_atr_dist, min_pct_dist)
+        
+        actual_stop_distance = abs(entry_price - stop)
+        if actual_stop_distance < min_stop_distance:
+            # Stop is too tight - expand it to minimum safe distance
+            if setup.direction == Dir.UP:
+                stop = entry_price - min_stop_distance
+            else:
+                stop = entry_price + min_stop_distance
+        
         tp = setup.tp1
         confidence = self.cfg.ml_default_probability
         return EntrySignal(

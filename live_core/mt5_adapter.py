@@ -238,7 +238,15 @@ class MetaTrader5Adapter:
         if self._mock:
             return self._mock_rates(symbol, bars)
         try:
-            frame = mt5.TIMEFRAME_H1 if timeframe == "H1" else mt5.TIMEFRAME_M30
+            tf = (timeframe or "").upper()
+            if tf in {"H1", "1H"}:
+                frame = mt5.TIMEFRAME_H1
+            elif tf in {"M30", "30M"}:
+                frame = mt5.TIMEFRAME_M30
+            elif tf in {"D1", "1D", "DAILY"}:
+                frame = mt5.TIMEFRAME_D1
+            else:
+                raise ValueError(f"Unsupported timeframe '{timeframe}' (expected H1/M30/D1)")
             rates = mt5.copy_rates_from_pos(symbol, frame, 0, bars)
             if rates is None:
                 raise RuntimeError("MT5 lieferte keine Kurse")

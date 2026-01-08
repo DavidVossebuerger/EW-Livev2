@@ -17,6 +17,13 @@ import numpy as np
 from .signals import EntrySignal, Dir
 from .config import LiveConfig
 
+# Import volatility forecaster (optional)
+try:
+    from volatility_backtest import VolatilityForecaster, create_vola_forecaster
+    VOLA_FORECAST_AVAILABLE = True
+except ImportError:
+    VOLA_FORECAST_AVAILABLE = False
+
 logger = logging.getLogger("ew.risk")
 
 
@@ -88,6 +95,24 @@ class RiskManager:
 
         # Portfolio Risk Tracking
         self.portfolio_metrics_history: Deque[RiskMetrics] = deque(maxlen=1000)
+
+        # Volatility Forecast for position sizing
+        self.vola_forecaster = None
+        self.vola_forecast_ready = False
+        self._vola_forecast_cache: Dict[str, Dict] = {}  # Cache per symbol
+        self._vola_forecast_cache_time: Dict[str, datetime] = {}
+        self._vola_cache_ttl_seconds = 3600  # 1 hour cache
+        
+        if getattr(cfg, 'use_vola_forecast', False) and VOLA_FORECAST_AVAILABLE:
+            try:
+                window = getattr(cfg, 'vola_forecast_window', 252)
+                self.vola_forecaster = create_vola_forecaster(train_window=window)
+                self.vola_forecast_ready = True
+                logger.info(f"Volatility Forecaster initialized (window={window})")
+            except Exception as e:
+                logger.warning(f"Volatility Forecaster init failed: {e}")
+        elif getattr(cfg, 'use_vola_forecast', False) and not VOLA_FORECAST_AVAILABLE:
+            logger.warning("use_vola_forecast=True but volatility_backtest.py not available")
 
         logger.info(
             "Risk Manager initialisiert mit Differential ML SensitivitÃ¤ten"
@@ -214,7 +239,86 @@ class RiskManager:
         # Map factor in [MIN, MAX]
         factor = max(self.MIN_SENSITIVITY_FACTOR, min(self.MAX_SENSITIVITY_FACTOR, factor))
         adjusted = base_volume * factor
+        
+        # Apply volatility forecast sizing if available
+        vola_mult = self._get_vola_size_multiplier(market_uncertainty.get("symbol"))
+        if vola_mult != 1.0:
+            logger.debug(f"Vola forecast multiplier: {vola_mult:.2f}")
+            adjusted *= vola_mult
+        
         return max(self.cfg.min_lot, min(adjusted, self.cfg.max_lot))
+    
+    def _get_vola_size_multiplier(self, symbol: Optional[str] = None) -> float:
+        """Get position size multiplier from volatility forecast.
+        
+        Returns:
+            Multiplier between 0.6 (high vola, size down) and 1.15 (low vola, size up)
+        """
+        if not self.vola_forecast_ready or self.vola_forecaster is None:
+            return 1.0
+        
+        # Check cache first
+        cache_key = symbol or "default"
+        now = datetime.now(timezone.utc)
+        if cache_key in self._vola_forecast_cache:
+            cache_time = self._vola_forecast_cache_time.get(cache_key)
+            if cache_time and (now - cache_time).total_seconds() < self._vola_cache_ttl_seconds:
+                cached = self._vola_forecast_cache[cache_key]
+                return cached.get('size_multiplier', 1.0)
+        
+        # No valid cache - we need daily data to forecast
+        # In live system, this is called from execution with market_uncertainty dict
+        # We'll use the cached result or default to 1.0
+        # The actual forecast is done in update_vola_forecast() called from cycle
+        return self._vola_forecast_cache.get(cache_key, {}).get('size_multiplier', 1.0)
+    
+    def update_vola_forecast(self, symbol: str, daily_df) -> Optional[Dict]:
+        """Update volatility forecast using daily data.
+        
+        Called from cycle.py when new daily data is available.
+        
+        Args:
+            symbol: Trading symbol
+            daily_df: DataFrame with daily OHLC data
+            
+        Returns:
+            Forecast dict with 'size_multiplier', 'regime', 'forecast', or None
+        """
+        if not self.vola_forecast_ready or self.vola_forecaster is None:
+            return None
+        
+        try:
+            import pandas as pd
+            
+            # Prepare data if not already prepared
+            if 'log_returns' not in daily_df.columns:
+                daily_df = self.vola_forecaster.prepare_data(daily_df.copy())
+            
+            # Get forecast for latest bar
+            idx = len(daily_df) - 1
+            window = getattr(self.cfg, 'vola_forecast_window', 252)
+            
+            if idx < window:
+                logger.debug(f"Not enough data for vola forecast: {idx} < {window}")
+                return None
+            
+            result = self.vola_forecaster.forecast_volatility(daily_df, idx)
+            
+            if result:
+                # Cache the result
+                self._vola_forecast_cache[symbol] = result
+                self._vola_forecast_cache_time[symbol] = datetime.now(timezone.utc)
+                
+                logger.info(
+                    f"[{symbol}] Vola forecast: regime={result.get('regime')}, "
+                    f"mult={result.get('size_multiplier', 1.0):.2f}"
+                )
+                return result
+                
+        except Exception as e:
+            logger.warning(f"Vola forecast update failed: {e}")
+        
+        return None
 
     def compute_risk_metrics(
         self,

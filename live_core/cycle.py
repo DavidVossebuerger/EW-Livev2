@@ -83,10 +83,38 @@ class CycleRunner:
 
         for symbol in symbols_list:
             self.cfg.symbol = symbol
-            rates = self.adapter.get_rates(symbol, self.cfg.timeframe, self.cfg.lookback_bars)
-            df = build_dataframe(rates)
-            df = self.engine.preprocess(df)
-            signals = self.engine.build_signals(df, symbol)
+            if getattr(self.cfg, "use_topdown_structure", False):
+                daily_bars = int(getattr(self.cfg, "daily_lookback_bars", self.cfg.lookback_bars) or self.cfg.lookback_bars)
+                h1_bars = int(getattr(self.cfg, "h1_lookback_bars", self.cfg.lookback_bars) or self.cfg.lookback_bars)
+                m30_bars = int(getattr(self.cfg, "m30_lookback_bars", self.cfg.lookback_bars) or self.cfg.lookback_bars)
+
+                daily_rates = self.adapter.get_rates(symbol, "D1", daily_bars)
+                h1_rates = self.adapter.get_rates(symbol, "H1", h1_bars)
+                m30_rates = self.adapter.get_rates(symbol, "M30", m30_bars)
+
+                daily_df = build_dataframe(daily_rates)
+                h1_df = build_dataframe(h1_rates)
+                m30_df = build_dataframe(m30_rates)
+
+                # Update volatility forecast if enabled (uses daily data)
+                if getattr(self.cfg, 'use_vola_forecast', False) and not daily_df.empty:
+                    try:
+                        self.manager.risk_manager.update_vola_forecast(symbol, daily_df)
+                    except Exception as e:
+                        self.logger(symbol, f"Vola forecast update failed: {e}")
+
+                signals = self.engine.build_signals_topdown(
+                    daily_df=daily_df,
+                    h1_df=h1_df,
+                    m30_df=m30_df,
+                    symbol=symbol,
+                )
+                tf_label = "TOPDOWN"
+            else:
+                rates = self.adapter.get_rates(symbol, self.cfg.timeframe, self.cfg.lookback_bars)
+                df = build_dataframe(rates)
+                signals = self.engine.build_signals(df, symbol)
+                tf_label = self.cfg.timeframe
             total_signals += len(signals)
             last_signal = signals[-1] if signals else "none"
             self.logger(symbol, f"Signals={len(signals)} LastEntry={last_signal}")
@@ -96,7 +124,7 @@ class CycleRunner:
                     "symbol": symbol,
                     "cycle": self.cycle_index,
                     "signals": len(signals),
-                    "timeframe": self.cfg.timeframe,
+                    "timeframe": tf_label,
                     "last_entry": self._summarize_signal(last_signal) if isinstance(last_signal, EntrySignal) else None,
                 },
             )

@@ -60,12 +60,22 @@ AGGRESSIVE_PROFILE_DEFAULTS: Dict[str, Any] = {
     "vola_horizon_days": 2.0,
     "vola_lookback_bars": 400,
     "vola_min_samples": 80,
+    "min_stop_atr_mult": 1.0,
+    "min_stop_pct": 0.005,
+    "signal_dedup_window_minutes": 120,
+    "use_vola_forecast": True,
+    "vola_forecast_window": 252,
     "ml_probability_threshold": 0.65,
     "ml_threshold_shift": 0.0,
     "dynamic_trend_scaling": True,
     "setup_size_factors": {"C": 1.0, "W3": 0.85, "W5": 0.8},
     "tf_size_factors": {"H1": 1.0, "M30": 0.9},
     "max_gross_exposure_pct": 0.05,
+    # Top-down data acquisition (Backtest parity)
+    "use_topdown_structure": True,
+    "daily_lookback_bars": 800,
+    "h1_lookback_bars": 800,
+    "m30_lookback_bars": 1200,
 }
 
 
@@ -167,6 +177,20 @@ class LiveConfig:
     require_price_above_ema_fast: bool = False
     use_daily_ema: bool = False
     order_store_path: Optional[str] = "logs/orders.db"
+    # --- Top-down parity (Backtest) ---
+    use_topdown_structure: bool = True
+    daily_lookback_bars: int = 800
+    h1_lookback_bars: int = 800
+    m30_lookback_bars: int = 1200
+    # Minimum SL distance as multiple of ATR (prevents too tight stops)
+    min_stop_atr_mult: float = 1.0
+    # Fallback minimum SL distance as percentage of entry price
+    min_stop_pct: float = 0.005
+    # Signal deduplication window in minutes (same setup within window = duplicate)
+    signal_dedup_window_minutes: int = 120
+    # Volatility Forecast-based Position Sizing
+    use_vola_forecast: bool = True
+    vola_forecast_window: int = 252  # Training window in daily bars
 
     def __post_init__(self) -> None:
         if not hasattr(self, "_provided_fields"):
