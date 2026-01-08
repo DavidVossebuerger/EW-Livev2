@@ -1,0 +1,314 @@
+```markdown
+# PROJEKTAUFTRAG: "HYDRA PRICER" – INSTITUTIONELLES OPTIONS-PRICING & RISK MANAGEMENT TOOL
+
+## PROJEKTZIEL
+Entwickle ein vollständig funktionsfähiges, modulares Options-Bewertungs- und Risikomanagement-System in Python, das institutionellen Standards entspricht. Dieses Projekt soll meine quantitativen Fähigkeiten, mein Verständnis für Derivate-Pricing und meine Software-Engineering-Kompetenz demonstrieren – ideal für Bewerbungen bei State Street und BayernInvest.
+
+---
+
+## PHASE 1: CORE PRICING ENGINE
+
+### Aufgabe 1.1: Black-Scholes-Merton (BSM) Implementierung
+**Ziel:** Entwickle eine Python-Klasse `BlackScholesModel` zur Bewertung europäischer Call- und Put-Optionen.
+
+**Anforderungen:**
+- Erstelle eine Klasse mit Methoden `call_price()` und `put_price()`
+- Input-Parameter: `S` (Kassakurs), `K` (Strike), `T` (Restlaufzeit in Jahren), `r` (risikofreier Zinssatz), `sigma` (Volatilität)
+- Nutze `scipy.stats.norm.cdf()` für die kumulative Normalverteilung
+- Implementiere die vollständige BSM-Formel mit d1 und d2
+- Füge Docstrings und Type Hints hinzu
+- Erstelle Unit Tests für bekannte Testfälle
+
+**Technologie:** Python 3.10+, NumPy, SciPy
+
+---
+
+### Aufgabe 1.2: Cox-Ross-Rubinstein (CRR) Binomialmodell
+**Ziel:** Implementiere das Binomialmodell für amerikanische Optionen (mit früher Ausübung).
+
+**Anforderungen:**
+- Erstelle eine Klasse `BinomialModel` mit Parametern: `S`, `K`, `T`, `r`, `sigma`, `N` (Anzahl Zeitschritte)
+- Berechne Up- und Down-Faktoren: `u = exp(sigma * sqrt(dt))`, `d = 1/u`
+- Erstelle einen Preisbaum mit NumPy-Arrays (2D-Matrix)
+- Implementiere Rückwärtsinduktion zur Optionsbewertung
+- Berücksichtige frühe Ausübung bei amerikanischen Optionen: `max(intrinsic_value, continuation_value)`
+- Vergleiche Ergebnisse mit BSM für europäische Optionen als Validierung
+
+**Technologie:** Python, NumPy
+
+---
+
+## PHASE 2: ADVANCED ANALYTICS & RISK ENGINE
+
+### Aufgabe 2.1: Implementierung der "Greeks"
+**Ziel:** Berechne alle wichtigen Risikosensitivitäten für jede Option.
+
+**Anforderungen:**
+- Erweitere die `BlackScholesModel`-Klasse um folgende Methoden:
+  - `delta()`: Erste Ableitung nach S (Sensitivität zum Underlying)
+  - `gamma()`: Zweite Ableitung nach S (Krümmung des Delta)
+  - `vega()`: Ableitung nach sigma (Volatilitätssensitivität)
+  - `theta()`: Ableitung nach T (Zeitwertverfall pro Tag)
+  - `rho()`: Ableitung nach r (Zinssensitivität)
+- Nutze analytische Formeln für BSM-Greeks
+- Implementiere numerische Approximation (Finite-Differenzen) für CRR-Modell
+- Erstelle eine Methode `get_all_greeks()`, die ein Dictionary mit allen Werten zurückgibt
+
+**Formel-Referenzen:**
+- Delta (Call): N(d1)
+- Gamma: n(d1) / (S * sigma * sqrt(T))
+- Vega: S * n(d1) * sqrt(T)
+- Theta (Call): -(S * n(d1) * sigma) / (2 * sqrt(T)) - r * K * exp(-r*T) * N(d2)
+- Rho (Call): K * T * exp(-r*T) * N(d2)
+
+---
+
+### Aufgabe 2.2: Monte-Carlo-Simulations-Pricer
+**Ziel:** Entwickle einen flexiblen Monte-Carlo-Pricer für exotische und pfadabhängige Optionen.
+
+**Anforderungen:**
+- Erstelle eine Klasse `MonteCarloModel`
+- Simuliere Aktienkurspfade mit geometrischer brown'scher Bewegung:
+  - `S(t+dt) = S(t) * exp((r - 0.5*sigma²)*dt + sigma*sqrt(dt)*Z)` wobei Z ~ N(0,1)
+- Parameter: `n_simulations` (z.B. 10.000), `n_steps` (Zeitschritte pro Pfad)
+- Nutze NumPy-Vektorisierung für Performance
+- Implementiere Payoff-Berechnung für:
+  - Europäische Call/Put
+  - Asiatische Optionen (Average Price)
+  - Lookback-Optionen (Maximum/Minimum)
+- Berechne den diskontierten Erwartungswert: `exp(-r*T) * mean(payoffs)`
+- Implementiere Konfidenzintervalle für die Schätzung
+- Nutze `numpy.random.default_rng()` für reproduzierbare Zufallszahlen (mit seed)
+
+**Performance-Optimierung:**
+- Verwende NumPy-Arrays statt Python-Loops
+- Nutze Broadcasting für parallele Pfad-Berechnung
+
+---
+
+## PHASE 3: DASHBOARD & LIVE-DATEN
+
+### Aufgabe 3.1: Marktdaten-API Integration
+**Ziel:** Automatischer Abruf von Echtzeit-Kursdaten und Volatilitäten.
+
+**Anforderungen:**
+- Erstelle ein Modul `data_fetcher.py`
+- Implementiere Funktionen:
+  - `get_stock_price(ticker)`: Aktueller Aktienkurs
+  - `get_historical_volatility(ticker, period=30)`: Historische Volatilität (Standardabweichung der Log-Returns)
+  - `get_risk_free_rate()`: Aktueller risikofreier Zinssatz (z.B. 10Y Bundesanleihe oder US Treasury)
+- Nutze `yfinance` für Aktiendaten
+- Implementiere Error Handling für fehlgeschlagene API-Calls
+- Füge Caching hinzu (Cache für 5 Minuten), um API-Limits zu vermeiden
+
+**Technologie:** `yfinance`, Pandas
+
+---
+
+### Aufgabe 3.2: Interaktives Streamlit-Dashboard
+**Ziel:** Erstelle eine professionelle Web-UI zur Visualisierung aller Berechnungen.
+
+**Dashboard-Struktur:**
+
+**Header-Bereich:**
+- Titel: "HYDRA PRICER – Institutional Options Analytics"
+- Untertitel mit deinem Namen und Link zum GitHub-Repository
+
+**Sidebar (Input-Parameter):**
+- Ticker-Symbol (Text-Input)
+- Option-Typ: Call/Put (Radio Buttons)
+- Strike-Preis K (Number Input)
+- Restlaufzeit T in Tagen (Slider: 1-365)
+- Volatilität σ (Slider: 0.1-1.0 oder "Auto" via historische Berechnung)
+- Risikofreier Zinssatz r (Slider: 0-0.1 oder "Auto")
+- Pricing-Modell: BSM / Binomial / Monte Carlo (Dropdown)
+
+**Main Content Area:**
+
+**Tab 1: Pricing & Greeks**
+- Anzeige des aktuellen Aktienkurses (via API)
+- Berechneter Optionspreis (groß und prominent)
+- Tabelle mit allen Greeks (Delta, Gamma, Vega, Theta, Rho)
+- Vergleich der Modelle (BSM vs. Binomial vs. Monte Carlo) in einer Tabelle
+
+**Tab 2: Payoff-Diagramm**
+- Interaktive Grafik: X-Achse = Aktienkurs bei Fälligkeit, Y-Achse = Profit/Loss
+- Zeige Payoff-Kurve der Option
+- Markiere Break-Even-Punkt
+- Nutze Plotly für Interaktivität
+
+**Tab 3: Greeks-Visualisierung**
+- 4 Subplots (2x2 Grid):
+  - Delta vs. Aktienkurs
+  - Gamma vs. Aktienkurs
+  - Vega vs. Volatilität
+  - Theta vs. Restlaufzeit
+
+**Tab 4: Volatility Surface (Bonus)**
+- 3D-Plot oder Heatmap: Implizite Volatilität über Strike und Restlaufzeit
+- Nutze Dummy-Daten falls keine reale Optionskette verfügbar
+
+**Anforderungen:**
+- Nutze Streamlit für das Framework
+- Plotly für alle Diagramme (interaktiv und professionell)
+- Responsive Design (funktioniert auf Desktop und Tablet)
+- Lade-Indikatoren während Berechnungen (`st.spinner()`)
+- Professional Styling: Custom CSS für Farben (z.B. dunkles Theme)
+
+**Technologie:** Streamlit, Plotly, Pandas
+
+---
+
+## TECHNOLOGIE-STACK
+
+**Kern:**
+- Python 3.10+
+- NumPy (numerische Berechnungen)
+- SciPy (statistische Funktionen)
+- Pandas (Datenverarbeitung)
+
+**Visualisierung & UI:**
+- Streamlit (Web-Dashboard)
+- Plotly (interaktive Charts)
+
+**Daten:**
+- yfinance (Marktdaten-API)
+
+**Code-Qualität:**
+- Black (Code Formatter)
+- Type Hints für alle Funktionen
+- Docstrings (Google Style)
+- pytest für Unit Tests
+
+---
+
+## PROJEKT-STRUKTUR
+
+```
+hydra-pricer/
+├── src/
+│   ├── models/
+│   │   ├── black_scholes.py
+│   │   ├── binomial.py
+│   │   └── monte_carlo.py
+│   ├── greeks/
+│   │   └── greeks_calculator.py
+│   ├── data/
+│   │   └── data_fetcher.py
+│   └── utils/
+│       └── helpers.py
+├── app/
+│   └── streamlit_app.py
+├── tests/
+│   ├── test_black_scholes.py
+│   ├── test_binomial.py
+│   └── test_monte_carlo.py
+├── requirements.txt
+├── README.md
+└── .gitignore
+```
+
+---
+
+## DEPLOYMENT & PRÄSENTATION
+
+### GitHub Repository:
+- Erstelle öffentliches Repository: `hydra-options-pricer`
+- Professionelle README.md mit:
+  - Projektbeschreibung
+  - Screenshots des Dashboards
+  - Installation Instructions
+  - Technische Dokumentation der Modelle
+  - Link zur Live-Demo
+- Saubere Commit-History (keine "fix bug" commits, sondern "Implement Black-Scholes Greeks calculation")
+
+### Live-Deployment:
+- Deploy auf **Streamlit Community Cloud** (kostenlos)
+- URL-Format: `hydra-pricer.streamlit.app`
+- Diese URL kommt in den Lebenslauf und ins Anschreiben
+
+---
+
+## CODE-QUALITÄTS-STANDARDS
+
+**Für jede Datei:**
+- Module-Level Docstring mit Beschreibung
+- Alle Funktionen/Methoden haben Type Hints: `def call_price(S: float, K: float, ...) -> float:`
+- Google-Style Docstrings mit Args, Returns, Raises
+- Keine hartcodierten "Magic Numbers" – nutze Konstanten
+- Error Handling: Validiere Inputs (z.B. `S > 0`, `sigma > 0`)
+
+**Beispiel:**
+```
+def black_scholes_call(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """
+    Calculate European call option price using Black-Scholes-Merton model.
+    
+    Args:
+        S: Current stock price (spot price)
+        K: Strike price
+        T: Time to maturity in years
+        r: Risk-free interest rate (annualized)
+        sigma: Volatility (annualized standard deviation)
+    
+    Returns:
+        Fair value of the European call option
+    
+    Raises:
+        ValueError: If any input parameter is negative or invalid
+    """
+    # Implementation here
+```
+
+---
+
+## TESTING-ANFORDERUNGEN
+
+Erstelle Unit Tests für:
+- BSM-Modell mit bekannten Benchmark-Werten (z.B. aus Fachliteratur)
+- Greeks-Berechnungen (teste gegen analytische Werte)
+- Put-Call-Parity: `Call - Put = S - K*exp(-r*T)` (europäische Optionen)
+- Monte-Carlo-Konvergenz (höhere Simulation = genauere Ergebnisse)
+
+Nutze `pytest` und erreiche mindestens 80% Code Coverage.
+
+---
+
+## ZEITPLAN & MEILENSTEINE
+
+- **Tag 1-2:** Phase 1.1 (BSM)
+- **Tag 3-4:** Phase 1.2 (Binomial)
+- **Tag 5-7:** Phase 2.1 (Greeks)
+- **Tag 8-10:** Phase 2.2 (Monte Carlo)
+- **Tag 11-12:** Phase 3.1 (API-Integration)
+- **Tag 13-16:** Phase 3.2 (Dashboard)
+- **Tag 17-18:** Testing & Bugfixes
+- **Tag 19-20:** Deployment & Dokumentation
+
+---
+
+## ERFOLGS-KRITERIEN
+
+Das Projekt ist abgeschlossen wenn:
+1. ✅ Alle drei Pricing-Modelle funktionieren und validierte Ergebnisse liefern
+2. ✅ Alle Greeks werden korrekt berechnet
+3. ✅ Das Streamlit-Dashboard ist voll funktionsfähig und deployed
+4. ✅ Die Live-Demo läuft stabil unter der öffentlichen URL
+5. ✅ Das GitHub-Repository ist professionell dokumentiert
+6. ✅ Mindestens 80% Test Coverage erreicht
+
+---
+
+## HINWEISE FÜR DIE IMPLEMENTIERUNG
+
+- **Performance:** Nutze NumPy-Vektorisierung statt Python-Loops wo möglich
+- **Modularität:** Jedes Modell ist eine separate Klasse – erleichtert Erweiterungen
+- **Fehlertoleranz:** Implementiere Try-Except-Blöcke für API-Calls und User-Inputs
+- **User Experience:** Gib klare Fehlermeldungen im Dashboard (z.B. "Ticker XYZ nicht gefunden")
+- **Professionalität:** Kommentiere komplexe mathematische Abschnitte
+
+---
+
+END OF PROJECT SPECIFICATION
+```
+

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.DS_Store
+.venv/
+.env
+.env.local
+*.log
+
+# VS Code
+.vscode/
+
+# Streamlit cache
+.streamlit/

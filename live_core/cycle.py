@@ -67,14 +67,9 @@ class CycleRunner:
         momentum_exits = 0
         symbols_list = list(symbols)
 
-        # Momentum-Exit Check vor neuen Signalen
+        # Momentum-Exit Check vor neuen Signalen (Backtest-Parität)
         if not dry_run and getattr(self.cfg, "use_momentum_exit", False):
-            lookback = getattr(self.cfg, "momentum_exit_lookback", 10)
-            threshold = getattr(self.cfg, "momentum_exit_threshold", 0.002)
-            momentum_exits = self.manager.check_momentum_exits(
-                momentum_lookback=lookback,
-                momentum_threshold=-threshold,  # Negativ für adverse Bewegung
-            )
+            momentum_exits = self.manager.check_momentum_exits()
             if momentum_exits > 0:
                 self._struct_log(
                     "momentum_exits",

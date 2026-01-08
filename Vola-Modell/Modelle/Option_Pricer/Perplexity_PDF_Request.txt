@@ -1,0 +1,27 @@
+Hey Perplexity,
+
+Bitte erstelle eine anschauliche PDF-Erklärung über mein HYDRA PRICER Projekt. Zielgruppe: Jugendliche (also locker und verständlich, gern mit Vergleichen aus dem Alltag). Strukturvorschlag:
+
+1. Intro: Was ist eine Option? Warum gibt es Call/Put und wofür braucht man Pricing-Modelle?
+2. Modelle im Projekt (alle kurz, simpel erklären – gern mit Beispielen):
+   - Black-Scholes (kontinuierlicher Ansatz, Inputs Spot/Strike/Laufzeit/σ/r)
+   - Binomial Tree inkl. American vs. European
+   - Monte-Carlo mit exotischen Payoffs (Asian, Lookback, Barrier)
+3. Analytics & Tools:
+   - Greeks (Delta, Gamma, Vega, Theta, Rho) + warum Trader sie brauchen
+   - Implied-Volatility-Kalibrierung (Newton-Raphson Idee)
+   - Delta-Hedge-Backtesting (warum man damit die Strategie checkt)
+4. Streamlit Dashboard Features:
+   - Pricing & Vergleichstabellen
+   - Payoff-, Greeks-, Vol-Surface-Visualisierungen
+   - Calibration & Backtesting Tabs
+   - Education Mode (Szenario-Presets, Lexikon, Glossar)
+5. Takeaways / Was man daraus lernt (z. B. „So baust du deine erste Options-Analytics-Plattform“)
+
+Wichtige Hinweise:
+- Schreib locker, jugendgerecht und motivierend (kein Uni-Professorenstil).
+- Verwende einfache Beispiele (z. B. Taschenlampen-Vergleich für Volatilität, Ampel fürs Risikomanagement).
+- Kurze Absätze, klare Bulletpoints, ggf. kleine Infoboxen oder „Fun Facts“.
+- Am Ende gerne eine Mini-Checkliste „Was du als Nächstes probieren kannst“.
+
+Danke! :)

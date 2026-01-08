@@ -1,0 +1,38 @@
+Risk Management Workflow (RiskManager + Integration)
+
+1) Inputs & Snapshot
+- Basis: EntrySignal (entry_price, stop_loss, take_profit, direction, setup, confidence, ATR/EMA/volatility optional)
+- OrderManager _apply_risk_manager_adjustment baut market_data: price, atr, ema_fast/slow, volatility, price_history, returns_window; historical_outcomes aktuell leer
+- market_uncertainty: volatility (und optional spread) aus market_data
+
+2) Sensitivitäten (calculate_sensitivities)
+- Robust gegen None/Parsing; price_current fallback auf entry_price
+- Volatilität: market_data["volatility"] oder std(returns_window); Momentum: first/last aus price_history; EMA-Distanz: |ema_fast-ema_slow|/price
+- LRM-Heuristiken bei kurzer Historie (<10): delta_atr=-0.5, delta_volatility=-0.3, delta_momentum ±0.4 je Richtung, delta_ema=-0.2
+- Bei ausreichender Historie: Likelihood Ratio Method auf ATR/Vol/Momentum/EMA, Clamping [-2,2]
+- Gamma_ATR optional wenn cfg.use_ml_filters aktiv; Confidence aus Erfolgsquote (Penalty bei wenig Daten)
+- Sensitivitäten werden in History (global + per Symbol) gespeichert
+
+3) Positionsgrößen-Anpassung (adjust_position_size_for_sensitivities)
+- sens_score = Mittelwert der Beträge der vier Deltas
+- uncert_factor = 1/(1 + (volatility + spread))
+- conf_factor = 0.5 + 0.5*confidence (zieht Richtung 1 bei hoher Confidence)
+- factor = sens_score * conf_factor * uncert_factor, begrenzt auf [MIN_SENSITIVITY_FACTOR=0.3, MAX_SENSITIVITY_FACTOR=2.0]
+- adjusted_volume = base_volume * factor, gekappt auf [cfg.min_lot, cfg.max_lot]
+
+4) Integration im OrderManager
+- Nach Basis-Volumenberechnung -> RiskManager-Scaling -> Re-Align auf Broker-Limits (min/max/step) -> Log "Volume adjusted by RiskManager"
+- Wenn adjusted_volume <= 0: Signal übersprungen (Exposure-Limit/Null-Volumen)
+
+5) Portfolio-Risikomessung
+- compute_risk_metrics(open_positions, recent_returns, equity):
+  * total_exposure = Summe volume*price
+  * risk_per_trade Mapping, volatility (realized), VaR95/ES, Sharpe-Estimate, Max Drawdown
+  * sensitivity_weighted_exposure aktuell = exposure, Metrics-History gepflegt
+- log_risk_state schreibt Kernzahlen in Log
+
+6) Outcome-Tracking
+- track_trade_outcome(symbol, pnl, risk_amount, success, snapshot) speichert PnL vs. Risk und optional Markt-Snapshot für adaptive Kalibrierung
+
+7) Defaults & Grenzen
+- MAX_SENSITIVITY_FACTOR 2.0, MIN 0.3, SENSITIVITY_HISTORY_SIZE 100; realized_pnl/estimated_risk deque maxlen 200; portfolio_metrics_history maxlen 1000

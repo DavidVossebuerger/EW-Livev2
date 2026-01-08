@@ -1,0 +1,99 @@
+Risk Manager & Live-System Workflow
+===================================
+
+1) Übersicht der Module
+-----------------------
+- live_core/signals.py: Elliott-Wave/Pattern-Engine, erzeugt EntrySignals (Richtung, Price, SL/TP, Confidence).
+- live_core/ml_model.py: Liefert ML-Wahrscheinlichkeiten (Confidence) pro Signal.
+- live_core/execution.py: OrderManager, validiert Signale, skaliert Stops/TP, berechnet Volumen, platziert Orders bei MT5.
+- live_core/risk_manager.py: Neu. Berechnet Sensitivitäten (Differential ML / LRM), passt Positionsgröße an, trackt Risiko-Metriken.
+- live_core/config.py: LiveConfig mit Risk- und Sizing-Parametern (risk_per_trade, max_exposure, ML-Filter etc.).
+- live_core/mt5_adapter.py: Adapter für Broker/MT5 (Preise, Orderplatzierung, Positions- und Symboldaten).
+
+2) Datenfluss pro Trade
+-----------------------
+1. Preise/Indicatoren kommen über Adapter (mt5_adapter) oder vorbereitete Daten.
+2. signals.ElliottEngine generiert EntrySignals (entry_time, direction, entry_price, stop_loss, take_profit, confidence etc.).
+3. execution.OrderManager.evaluate_signals prüft:
+   - ML-Filter (confidence > threshold)
+   - Duplicate/Cooldown/Max Trades
+   - Profit Factor / Stop-Abstände
+   - Exposure-Limits
+4. Volumen-Berechnung: _calculate_volume() (risikobasiert, Stop-Distanz, caps, leverage).
+5. RiskManager-Adjustment (neu):
+   - _apply_risk_manager_adjustment() baut market_data aus Signal (price, atr, ema_fast/slow, volatility, price_history, returns_window).
+   - risk_manager.calculate_sensitivities(): LRM-Sensitivitäten zu ATR, Vol, Momentum, EMA-Distanz; optional Gamma.
+   - risk_manager.adjust_position_size_for_sensitivities(): moduliert base_volume via Sensitivitäts-Score, Confidence, Unsicherheitsfaktor.
+6. Orderplatzierung via mt5_adapter (Market oder Pending).
+7. Nach Trades: track_trade_outcome() kann mit PnL/Risk gefüttert werden, um spätere Sensitivitäts-Schätzungen zu verbessern.
+
+3) RiskManager im Detail
+------------------------
+- calculate_sensitivities(signal, market_data, historical_outcomes):
+  - Volatilitätsschätzung, Momentum, EMA-Distanz aus market_data.
+  - LRM-Sensitivitäten: delta_atr, delta_volatility, delta_price_momentum, delta_ema_distance; optional gamma_atr.
+  - Confidence aus historischen Outcomes (Erfolgsrate, Penalty bei wenig Daten).
+- adjust_position_size_for_sensitivities(base_volume, sensitivities, market_uncertainty):
+  - Sensitivitäts-Score = Mittel der |Deltas|; Unsicherheitsfaktor aus volatility/spread; Confidence-Scaling.
+  - Clamp auf MIN_SENSITIVITY_FACTOR .. MAX_SENSITIVITY_FACTOR; respektiert cfg.min_lot / cfg.max_lot.
+- compute_risk_metrics(open_positions, recent_returns, equity):
+  - Exposure, per-symbol risk, realized Vol, VaR/ES (95%), Sharpe, Max DD, sensitivity_weighted_exposure.
+  - log_risk_state(metrics): Logging-Hook.
+- track_trade_outcome(symbol, pnl, risk_amount, success, market_snapshot):
+  - Speichert Outcomes, füttert rudimentäre Sensitivitäts-Historie (für künftige Kalibrierung).
+
+4) Integration in execution.py
+------------------------------
+- OrderManager hat jetzt self.risk_manager = RiskManager(cfg).
+- Nach _calculate_volume() wird _apply_risk_manager_adjustment() aufgerufen:
+  - Baut market_data aus Signal-Feldern (price, atr, ema_fast/slow, volatility, price_history, returns_window).
+  - Ruft RiskManager.calculate_sensitivities() und adjust_position_size_for_sensitivities().
+  - Loggt Anpassung (base -> adjusted).
+
+5) Konfiguration / Flags
+------------------------
+- LiveConfig steuert generelles Risiko (risk_per_trade, risk_per_trade_min/max, size_short_factor, max_gross_exposure_pct etc.).
+- RiskManager interne Grenzen: MIN_SENSITIVITY_FACTOR=0.3, MAX_SENSITIVITY_FACTOR=2.0, History-Längen.
+- Gamma-Berechnung wird aktiviert, wenn cfg.use_ml_filters True ist (Reuse eines bestehenden Flags).
+
+6) Betriebs-Workflow (End-to-End)
+----------------------------------
+1. Start: MT5-Adapter verbinden, LiveConfig laden (env oder Datei), OrderManager + RiskManager instanzieren.
+2. Markt-Scan: Signale generieren (signals.ElliottEngine) mit aktuellen ATR/EMA/Vol-Daten; Confidence aus ml_model.MLProbabilityProvider.
+3. Filtering & Sizing: OrderManager evaluiert Signale, berechnet Volumen, RiskManager moduliert Volumen sensitivitätsbasiert.
+4. Execution: Orders senden (market/pending), Stops/TP laut scale.
+5. Monitoring: risk_manager.compute_risk_metrics() regelmäßig mit offenen Positionen + recent_returns aufrufen, log_risk_state() loggt.
+6. Feedback: track_trade_outcome() mit echten PnL/Erfolg füttern, um Sensitivitäten/Confidence laufend zu kalibrieren.
+
+7) Anpassen / Erweiterungen
+---------------------------
+- Sensitivitätsquellen erweitern: weitere Features (Spread, Orderbook-Depth) in market_data geben.
+- Historicals: echte Trade-Historie einspeisen in historical_outcomes (mit success, atr, volatility, momentum, ema_distance).
+- Sizing-Policy: adjust_position_size_for_sensitivities() kann alternativ auf additive oder capped/logarithmische Skalierung umgestellt werden.
+- Risk-Metriken: compute_risk_metrics() kann mit Echtzeit-Positionsdaten (inkl. Margin) und Broker-PnL erweitert werden.
+
+8) Schnellstart Beispiel (Pseudocode)
+-------------------------------------
+from live_core.config import LiveConfig
+from live_core.mt5_adapter import MetaTrader5Adapter
+from live_core.execution import OrderManager
+
+cfg = LiveConfig.load_from_file("config.json")
+adapter = MetaTrader5Adapter(cfg)
+om = OrderManager(adapter, cfg)
+
+signals = [...]  # von signals.ElliottEngine erzeugt
+stats = om.evaluate_signals("XAUUSD", signals)
+print(stats)
+
+# Periodisch Risiko-Status loggen
+positions = adapter.get_positions()
+recent_returns = [...]  # z.B. trade PnLs / equity returns
+metrics = om.risk_manager.compute_risk_metrics(positions, recent_returns, equity=adapter.balance())
+om.risk_manager.log_risk_state(metrics)
+
+9) Hinweise
+-----------
+- Market_data im RiskManager ist minimal; je mehr Felder (atr, volatility, ema_fast/slow, price_history, returns_window) übergeben werden, desto besser.
+- Die momentane Gamma-Approx ist konservativ (short-gamma), kann mit echten zweiten Ableitungen ersetzt werden.
+- Für produktiven Einsatz sollten historical_outcomes aus realer Trade-Historie gespeist werden.

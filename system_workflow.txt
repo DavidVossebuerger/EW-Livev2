@@ -1,0 +1,416 @@
+# System-Workflow Dokumentation: EW_Live_v2
+
+Dieses Dokument beschreibt den detaillierten Workflow des EW_Live_v2 Systems, von der Initialisierung bis zur Order-Ausführung. Es dient als umfassende Referenz für Entwickler und Administratoren.
+
+---
+
+## Inhaltsverzeichnis
+
+1.  [Einführung](#1-einführung)
+2.  [System-Architektur](#2-system-architektur)
+3.  [Modul-Übersicht](#3-modul-übersicht)
+4.  [Detaillierter Workflow](#4-detaillierter-workflow)
+    *   [4.1 Initialisierung (`main.py`)](#41-initialisierung-mainpy)
+    *   [4.2 Der Haupt-Zyklus (`CycleRunner`)](#42-der-haupt-zyklus-cyclerunner)
+    *   [4.3 Datenbeschaffung (`MetaTrader5Adapter`)](#43-datenbeschaffung-metatrader5adapter)
+    *   [4.4 Signal-Generierung (`SignalEngine`)](#44-signal-generierung-signalengine)
+    *   [4.5 Order-Management (`OrderManager`)](#45-order-management-ordermanager)
+    *   [4.6 Risiko-Management (`RiskManager`)](#46-risiko-management-riskmanager)
+    *   [4.7 Volatilitäts-Filter (`VolatilityGate`)](#47-volatilitäts-filter-volatilitygate)
+    *   [4.8 Persistenz (`OrderStore`)](#48-persistenz-orderstore)
+    *   [4.9 ML-Integration (`MLProbabilityProvider`)](#49-ml-integration-mlprobabilityprovider)
+5.  [Konfiguration (`LiveConfig`)](#5-konfiguration-liveconfig)
+6.  [Logging & Monitoring](#6-logging--monitoring)
+7.  [Fehlerbehandlung & Recovery](#7-fehlerbehandlung--recovery)
+8.  [Datenbank-Schema](#8-datenbank-schema)
+
+---
+
+## 1. Einführung
+
+Das **EW_Live_v2** System ist eine hochentwickelte, automatisierte Handelsplattform, die auf der Elliott-Wellen-Theorie basiert. Es ist darauf ausgelegt, Finanzmärkte in Echtzeit zu überwachen, komplexe Chartmuster zu identifizieren und Handelsentscheidungen autonom zu treffen. Das System interagiert direkt mit der MetaTrader 5 (MT5) Plattform über eine Python-API.
+
+### Kernziele
+*   **Automatisierung**: Vollständige Eliminierung manueller Eingriffe im Standardbetrieb.
+*   **Robustheit**: Fehlertoleranz gegenüber Verbindungsabbrüchen, API-Fehlern und Datenlücken.
+*   **Risikokontrolle**: Striktes Management von Positionsgrößen und Portfolio-Exposure.
+*   **Erweiterbarkeit**: Modulare Architektur, die das Hinzufügen neuer Strategien oder Filter (z.B. Machine Learning) erleichtert.
+
+---
+
+## 2. System-Architektur
+
+Das System folgt einer zyklischen Architektur. Ein zentraler Orchestrator (`CycleRunner`) steuert den Datenfluss zwischen den Komponenten.
+
+```mermaid
+graph TD
+    Main[main.py] --> Config[LiveConfig]
+    Main --> Adapter[MetaTrader5Adapter]
+    Main --> Runner[CycleRunner]
+    
+    Runner --> Adapter
+    Runner --> Engine[SignalEngine]
+    Runner --> Manager[OrderManager]
+    
+    Engine --> ML[MLProbabilityProvider]
+    
+    Manager --> Risk[RiskManager]
+    Manager --> Vola[VolatilityGate]
+    Manager --> Store[OrderStore]
+    Manager --> Adapter
+    
+    Adapter <--> MT5[(MetaTrader 5 Terminal)]
+    Store <--> DB[(SQLite Database)]
+```
+
+---
+
+## 3. Modul-Übersicht
+
+### `main.py`
+Der Einstiegspunkt. Initialisiert Logging, Konfiguration und die Hauptkomponenten. Startet den Endlos-Loop.
+
+### `live_core/config.py`
+Definiert die `LiveConfig` Klasse. Verwaltet alle Parameter (Risiko, Timeframes, Pfade) und ermöglicht Overrides via CLI oder JSON.
+
+### `live_core/mt5_adapter.py`
+Die Brücke zu MetaTrader 5. Kapselt alle `MetaTrader5` Bibliotheksaufrufe. Behandelt Verbindungsaufbau, Datenabruf (OHLC), Order-Versand und Fehlercodes.
+
+### `live_core/cycle.py`
+Beinhaltet den `CycleRunner`. Dieser koordiniert den Ablauf eines einzelnen Durchlaufs: Daten holen -> Signale berechnen -> Orders managen.
+
+### `live_core/signals.py`
+Die "Intelligenz" des Systems. Implementiert den ZigZag-Algorithmus, erkennt Elliott-Wellen-Muster (Impulse, Korrekturen) und generiert `EntrySignal` Objekte.
+
+### `live_core/execution.py`
+Der `OrderManager`. Entscheidet, ob ein Signal gehandelt wird. Prüft Filter, berechnet Positionsgrößen (via RiskManager) und sendet Orders an den Adapter.
+
+### `live_core/risk_manager.py`
+Berechnet die Lot-Größe basierend auf Kontostand, Risiko-Parametern und Stop-Loss-Distanz. Überwacht das Gesamt-Exposure.
+
+### `live_core/volatility_gate.py`
+Ein statistischer Filter, der prüft, ob die aktuelle Marktvolatilität ausreicht, um das Kursziel innerhalb eines bestimmten Zeithorizonts zu erreichen.
+
+### `live_core/order_store.py`
+Verwaltet die lokale SQLite-Datenbank (`orders.db`). Speichert ausgeführte Orders und aktive Positionen, um Duplikate zu vermeiden.
+
+### `live_core/ml_model.py`
+Optionales Modul, das externe Wahrscheinlichkeiten (z.B. aus einem KI-Modell) lädt und den Signalen zuordnet.
+
+---
+
+## 4. Detaillierter Workflow
+
+### 4.1 Initialisierung (`main.py`)
+
+Der Prozess beginnt in `main.py`.
+
+1.  **Argument Parsing**: `argparse` wertet Kommandozeilenargumente aus (z.B. `--dry-run`, `--once`, `--config`).
+2.  **Logging Setup**:
+    *   Ein `RotatingFileHandler` schreibt in `live_execution.log`.
+    *   Ein `StreamHandler` schreibt auf die Konsole.
+    *   Ein spezieller `SegmentBufferHandler` sammelt Logs für zyklische Snapshots (`Ergebnisse/segments/`).
+    *   Ein `StructLogger` (`ew_struct`) wird für maschinenlesbare JSON-Logs eingerichtet.
+3.  **Konfiguration**: `LiveConfig` wird instanziiert. Falls eine JSON-Config angegeben wurde, werden Werte überschrieben.
+4.  **MT5-Start**:
+    *   `MetaTrader5Adapter` wird erstellt.
+    *   `adapter.connect()` versucht, sich mit dem Terminal zu verbinden.
+    *   `verify_mt5_connection()` prüft Kontodaten (Login, Server, Balance). Bei Fehler bricht das Skript ab.
+5.  **Cleanup (Optional)**: `adapter.cancel_all_orders()` löscht alle bestehenden Pending-Orders, um "Zombie-Orders" zu vermeiden.
+6.  **Komponenten-Instanziierung**:
+    *   `MLProbabilityProvider` (falls Pfad konfiguriert).
+    *   `SignalEngine` (erhält Config & ML-Provider).
+    *   `OrderManager` (erhält Adapter & Config).
+    *   `CycleRunner` (erhält alle obigen Komponenten).
+7.  **Loop-Start**: Eine `while True`-Schleife ruft `runner.run_cycle()` auf.
+
+### 4.2 Der Haupt-Zyklus (`CycleRunner`)
+
+Die Methode `run_cycle` in `live_core/cycle.py` ist der Taktgeber.
+
+**Input**: Liste von Symbolen (z.B. ["EURUSD", "DE40", "Gold"]).
+**Ablauf**:
+
+1.  **Zeitnahme**: Startzeit wird gespeichert.
+2.  **Iteration**: Schleife über jedes Symbol in der Liste.
+3.  **Kontext-Setzen**: `cfg.symbol` wird auf das aktuelle Symbol gesetzt.
+4.  **Schritt 1: Daten**: `adapter.get_rates(symbol, timeframe, lookback)` wird aufgerufen.
+    *   Rückgabe ist eine Liste von Dictionaries (OHLCV).
+    *   Konvertierung in Pandas DataFrame (`build_dataframe`).
+5.  **Schritt 2: Signale**: `engine.preprocess(df)` und `engine.build_signals(df, symbol)` werden aufgerufen.
+    *   Rückgabe ist eine Liste von `EntrySignal` Objekten.
+    *   Logging der Anzahl gefundener Signale.
+    *   Strukturiertes Logging (`symbol_signals`).
+6.  **Schritt 3: Ausführung**: `manager.evaluate_signals(symbol, signals)` wird aufgerufen.
+    *   Rückgabe ist ein `ExecutionCycleStats` Objekt (validiert, ausgeführt, Duplikate).
+    *   Statistiken werden aggregiert.
+7.  **Reporting**:
+    *   Nach der Symbol-Schleife wird eine Zusammenfassung geloggt (Dauer, Raten).
+    *   `manager.report_cycle_metrics()` liefert aktuelle Balance und Exposure.
+    *   Log-Segmente werden rotiert (`segment_writer.maybe_flush`).
+8.  **Pause**: `time.sleep(10)` (konfigurierbar) vor dem nächsten Zyklus.
+
+### 4.3 Datenbeschaffung (`MetaTrader5Adapter`)
+
+Die Klasse `MetaTrader5Adapter` in `live_core/mt5_adapter.py` abstrahiert die MT5-Komplexität.
+
+**Wichtige Methoden**:
+
+*   `get_rates(symbol, timeframe, count)`:
+    *   Prüft, ob das Symbol im "Market Watch" ist (`symbol_select`).
+    *   Ruft `mt5.copy_rates_from_pos` auf.
+    *   Behandelt Fehler (z.B. Verbindung verloren -> Reconnect-Versuch).
+    *   Gibt Rohdaten zurück.
+*   `get_current_price(symbol)`:
+    *   Ruft `mt5.symbol_info_tick` ab.
+    *   Liefert Bid/Ask zurück.
+*   `order_send(request)`:
+    *   Sendet eine Order-Struktur an `mt5.order_send`.
+    *   Wartet auf Antwort (`OrderSendResult`).
+    *   Implementiert Retry-Logik für spezifische Fehler (siehe 4.5).
+
+### 4.4 Signal-Generierung (`SignalEngine`)
+
+Die `SignalEngine` in `live_core/signals.py` transformiert Kursdaten in Handelssignale.
+
+**Prozess**:
+
+1.  **Preprocessing (`preprocess`)**:
+    *   Berechnet technische Indikatoren:
+        *   **ZigZag**: Identifiziert signifikante Hoch- und Tiefpunkte. Parameter: `primary_zz_pct` (Abweichung in %).
+        *   **RSI**: Relative Strength Index (optional für Filter).
+        *   **EMAs**: Exponential Moving Averages (Fast/Slow) für Trendbestimmung.
+        *   **ATR**: Average True Range für Volatilität.
+2.  **Mustererkennung (`build_signals`)**:
+    *   Iteriert durch die ZigZag-Pivots.
+    *   **Impuls-Erkennung (1-2-3-4-5)**:
+        *   Prüft Fibonacci-Verhältnisse zwischen den Wellen.
+        *   Welle 3 darf nicht die kürzeste sein.
+        *   Welle 4 darf nicht in den Preisbereich von Welle 1 eindringen (Overlap-Regel).
+    *   **Korrektur-Erkennung (A-B-C)**:
+        *   Sucht nach 3-welligen Strukturen gegen den Trend.
+        *   Prüft Retracement-Level der B-Welle.
+3.  **Setup-Generierung**:
+    *   Für erkannte Muster werden Einstiegszonen definiert (z.B. 50-61.8% Retracement der Vorwelle).
+    *   Stop-Loss wird am Invalidierungspunkt des Musters gesetzt (z.B. Start von Welle 1).
+    *   Take-Profits werden projiziert (Fibonacci-Extensions).
+4.  **Signal-Erstellung**:
+    *   Ein `EntrySignal` wird erzeugt, wenn der aktuelle Preis in der Einstiegszone liegt oder sich ihr nähert.
+    *   Attribute: `direction`, `entry_price`, `stop_loss`, `take_profit`, `setup_name` ("W3", "W5", "C").
+
+### 4.5 Order-Management (`OrderManager`)
+
+Der `OrderManager` in `live_core/execution.py` ist der Gatekeeper.
+
+**Evaluierungs-Logik (`evaluate_signals`)**:
+
+1.  **Input**: Liste von Signalen für ein Symbol.
+2.  **Schleife**: Verarbeitung jedes Signals (neueste zuerst).
+3.  **Duplikat-Check**:
+    *   Generiert einen eindeutigen Hash (`signal_key`) aus Symbol, Setup, Richtung und Zeit.
+    *   Fragt `OrderStore` ab: Wurde dieser Key bereits gehandelt?
+    *   Prüft `active_positions`: Gibt es offene Trades für dieses Symbol in gleicher Richtung?
+    *   Prüft `cooldown`: Wurde das Symbol vor kurzem gehandelt?
+4.  **Filterung**:
+    *   **Volatility Gate**: Ruft `vola_gate.probability_to_reach` auf. Wenn Wahrscheinlichkeit < Threshold -> Skip.
+    *   **ML-Filter**: Wenn `use_ml_filters` aktiv, wird die Wahrscheinlichkeit vom `MLProbabilityProvider` geprüft.
+    *   **Spread-Check**: Ist der aktuelle Spread zu hoch im Vergleich zum Gewinnpotenzial?
+5.  **Risiko-Berechnung**:
+    *   Ruft `risk_manager.calculate_lot_size` auf.
+    *   Wenn Lot-Größe <= 0 -> Skip (Risiko zu hoch oder Kapital zu klein).
+6.  **Ausführung**:
+    *   Ruft `adapter.place_limit_order` (oder Market) auf.
+    *   **Retry-Loop (MT5 Adapter)**:
+        *   Wenn Fehler `10014` (Invalid Volume): Volumen aufrunden (`_ceil_volume`) und Retry.
+        *   Wenn Fehler `10030` (Unsupported Filling): Anderen Filling-Mode (IOC, FOK, RETURN) probieren.
+        *   Maximal N Versuche.
+7.  **Post-Execution**:
+    *   Bei Erfolg: Speichern in `OrderStore` (`append_execution`).
+    *   Update der internen Caches (Cooldowns).
+    *   Strukturiertes Logging des Trades.
+
+### 4.6 Risiko-Management (`RiskManager`)
+
+Der `RiskManager` in `live_core/risk_manager.py` schützt das Kapital.
+
+**Berechnung (`calculate_lot_size`)**:
+
+1.  **Basis-Risiko**: `account_balance * risk_per_trade` (z.B. 10.000 * 1% = 100€).
+2.  **Stop-Distanz**: Differenz zwischen Entry und Stop-Loss in Punkten.
+3.  **Tick-Value**: Wert eines Punktes pro Lot (vom MT5 Symbol-Info).
+4.  **Formel**: `Lots = RiskAmount / (StopDistance * TickValue)`.
+5.  **Normalisierung**:
+    *   Runden auf `lot_step` (z.B. 0.01).
+    *   Klammern zwischen `min_lot` und `max_lot`.
+6.  **Exposure-Check**:
+    *   Prüft, ob das neue Lot das `max_gross_exposure_pct` (Hebel-Limit) sprengt.
+    *   Falls ja -> Reduzierung der Lots oder Ablehnung.
+7.  **Sensitivitäts-Analyse (Advanced)**:
+    *   Berechnet "Greeks" (Delta, Gamma) für das Signal.
+    *   Passt Positionsgröße basierend auf Volatilität und Konfidenz an (Differential ML Ansatz).
+
+### 4.7 Volatilitäts-Filter (`VolatilityGate`)
+
+Das `VolatilityGate` in `live_core/volatility_gate.py` bewertet die Machbarkeit.
+
+**Logik**:
+
+1.  **Input**: Aktueller Preis, Zielpreis (TP), historische Schlusskurse.
+2.  **Sigma-Schätzung**: Berechnet die tägliche Volatilität (`sigma_daily`) aus Log-Returns der letzten N Bars.
+3.  **Z-Score**:
+    *   Berechnet die benötigte Bewegung in Standardabweichungen für den Zeithorizont (`horizon_days`).
+    *   `Z = ln(Target/Current) / (Sigma * sqrt(Time))`
+4.  **Wahrscheinlichkeit**:
+    *   Nutzt die Normalverteilungs-CDF (Error Function), um die Wahrscheinlichkeit zu berechnen, dass der Preis das Ziel erreicht.
+5.  **Entscheidung**:
+    *   Wenn `Probability >= Threshold` -> `allows() = True`.
+
+### 4.8 Persistenz (`OrderStore`)
+
+Der `OrderStore` in `live_core/order_store.py` speichert den State.
+
+**Datenbank**: SQLite (`orders.db`).
+
+**Tabellen**:
+1.  `executions`: Historie aller getätigten Trades.
+    *   Spalten: `id`, `key` (Hash), `symbol`, `direction`, `timestamp`, `ticket` (MT5 ID).
+2.  `active_positions`: Aktuell offene Positionen (für schnellen Zugriff).
+    *   Spalten: `ticket`, `key`, `symbol`, `last_seen`, `opened`.
+
+**Methoden**:
+*   `check_exists(key)`: Prüft Existenz eines Signal-Hashes.
+*   `append_execution(record)`: Fügt neuen Trade hinzu.
+*   `get_active_tickets()`: Liefert Liste offener Tickets.
+
+### 4.9 ML-Integration (`MLProbabilityProvider`)
+
+Der `MLProbabilityProvider` in `live_core/ml_model.py` ist eine Schnittstelle für externe KI.
+
+**Funktion**:
+*   Lädt beim Start eine CSV oder JSON Datei (`ml_probability_path`).
+*   Speichert Wahrscheinlichkeiten in einem Dictionary: `Symbol -> [Entries]`.
+*   `get_probability(symbol, time, setup)`: Sucht den passenden Eintrag (mit Zeittoleranz) und gibt den Score (0.0 - 1.0) zurück.
+
+---
+
+## 5. Konfiguration (`LiveConfig`)
+
+Die Konfiguration ist zentralisiert in `live_core/config.py`.
+
+**Wichtige Parameter**:
+
+| Parameter | Beschreibung | Standard |
+| :--- | :--- | :--- |
+| `symbol` | Standard-Symbol (Fallback) | "NAS100" |
+| `timeframe` | Handels-Zeiteinheit | "H1" |
+| `risk_per_trade` | Risiko pro Trade (0.01 = 1%) | 0.01 |
+| `max_open_trades` | Max. gleichzeitige Trades | 1 |
+| `use_ml_filters` | ML-Filter aktivieren | False |
+| `ml_probability_threshold` | Min. Score für ML | 0.65 |
+| `use_vola_gate` | Vola-Filter aktivieren | True |
+| `order_store_path` | Pfad zur DB | "logs/orders.db" |
+| `webhook_url` | URL für Discord/Slack Alerts | None |
+
+**Profile**:
+Es gibt vordefinierte Profile (z.B. `AGGRESSIVE_PROFILE_DEFAULTS`), die Parameter-Sets bündeln. Diese können über `apply_aggressive_profile()` geladen werden.
+
+---
+
+## 6. Logging & Monitoring
+
+Das System generiert umfangreiche Logs für Debugging und Analyse.
+
+### Log-Dateien
+*   `live_execution.log`: Menschlesbares Log (INFO/WARNING/ERROR). Rotiert automatisch.
+*   `struct.log`: JSON-Lines Format. Enthält strukturierte Events (`cycle_summary`, `trade_execution`, `signal_rejected`). Ideal für Parsing (z.B. ELK Stack, Splunk).
+*   `Ergebnisse/segments/`: Zyklische Snapshots der Logs. Dienen als Backup und zur granularen Analyse einzelner Zyklen.
+
+### Strukturierte Events
+Beispiele für Events im `struct.log`:
+*   `startup`: Systemstart, Config-Werte.
+*   `cycle_start`: Beginn eines Zyklus.
+*   `symbol_signals`: Anzahl Signale pro Symbol.
+*   `signal_evaluation`: Details zur Prüfung eines Signals (Filter-Ergebnisse).
+*   `order_submitted`: Order an MT5 gesendet.
+*   `order_filled`: Order erfolgreich platziert.
+*   `error`: Exceptions und kritische Fehler.
+
+---
+
+## 7. Fehlerbehandlung & Recovery
+
+Das System ist auf Resilienz ausgelegt.
+
+### MT5-Verbindungsverlust
+*   Der Adapter prüft vor jeder Aktion `mt5.terminal_info()`.
+*   Bei Verbindungsverlust wird `mt5.shutdown()` und `mt5.initialize()` aufgerufen.
+*   Exponentielles Backoff bei wiederholten Fehlern.
+
+### Order-Fehler
+*   **Invalid Volume**: Automatische Korrektur (Aufrunden auf Step, Min/Max Check).
+*   **Requote**: Automatischer Retry mit neuerem Preis.
+*   **Market Closed**: Order wird verworfen, Log-Eintrag.
+
+### Daten-Inkonsistenz
+*   Wenn `get_rates` leere Daten liefert, wird das Symbol für diesen Zyklus übersprungen.
+*   Wenn Indikatoren (z.B. ATR) `NaN` liefern, wird kein Signal generiert.
+
+### Crash-Recovery
+*   Da der State in `orders.db` (SQLite) persistiert wird, kann das System nach einem Neustart sofort weiterarbeiten.
+*   Es weiß, welche Signale bereits gehandelt wurden und öffnet keine Duplikate.
+
+---
+
+## 8. Datenbank-Schema
+
+Details zur SQLite Datenbank (`orders.db`).
+
+### Tabelle `executions`
+Speichert die Historie.
+
+```sql
+CREATE TABLE executions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    key TEXT,           -- Hash des Signals (Unique Constraint Logik)
+    symbol TEXT,        -- Symbol Name (z.B. "EURUSD")
+    direction TEXT,     -- "UP" oder "DOWN"
+    timestamp TEXT,     -- ISO-8601 Zeitstempel der Ausführung
+    ticket TEXT         -- MT5 Order Ticket ID
+);
+```
+
+### Tabelle `active_positions`
+Speichert den aktuellen Bestand (wird regelmäßig mit MT5 synchronisiert).
+
+```sql
+CREATE TABLE active_positions (
+    ticket TEXT PRIMARY KEY, -- MT5 Ticket ID
+    key TEXT,                -- Signal Hash
+    symbol TEXT,
+    last_seen TEXT,          -- Zeitstempel des letzten Updates
+    opened TEXT              -- Zeitstempel der Eröffnung
+);
+```
+
+---
+
+## 9. Erweiterungsmöglichkeiten
+
+### Neue Strategien
+Um eine neue Strategie hinzuzufügen:
+1.  Erweitere `SignalEngine` um eine neue Methode (z.B. `detect_breakout`).
+2.  Definiere ein neues `Setup` in `signals.py`.
+3.  Passe `evaluate_signals` im `OrderManager` an, falls spezielle Regeln gelten.
+
+### Neue Filter
+Um einen Filter hinzuzufügen:
+1.  Implementiere die Logik (z.B. `NewsFilter` Klasse).
+2.  Integriere den Aufruf in `OrderManager.evaluate_signals`.
+3.  Füge Konfigurationsparameter in `LiveConfig` hinzu.
+
+### Dashboard
+Die strukturierten Logs (`struct.log`) und die Datenbank (`orders.db`) können von einem externen Dashboard (z.B. Streamlit, Grafana) ausgelesen werden, um Live-Metriken zu visualisieren.
+
+---
+
+*Dokumentation erstellt am 20.12.2025 für EW_Live_v2.*

@@ -1402,72 +1402,133 @@ class OrderManager:
         return history
 
     # =========================================================================
-    # Momentum-Exit: Schließe Positionen früh bei adverser Momentum-Bewegung
+    # Momentum-Exit (Backtest-Parität): Höhere TF, konsekutive abnehmende Bars
     # =========================================================================
 
-    def check_momentum_exits(self, momentum_lookback: int = 10, momentum_threshold: float = -0.002) -> int:
-        """Prüft alle offenen Positionen auf adverses Momentum und schließt sie ggf.
+    # State für declining momentum count pro Position (ticket -> count)
+    _momentum_decline_count: Dict[int, int] = {}
+    _momentum_last_value: Dict[int, float] = {}
 
-        Args:
-            momentum_lookback: Anzahl Bars für Momentum-Berechnung
-            momentum_threshold: Schwellwert für adverses Momentum (negativ = gegen Position)
-
+    def check_momentum_exits(self) -> int:
+        """Prüft alle offenen Positionen auf abnehmenden Momentum auf höherer TF.
+        
+        Backtest-Logik:
+        - M30-Entry → Check Momentum auf H1
+        - H1-Entry → Check Momentum auf Daily
+        - Nach N konsekutiven Bars mit schwächer werdendem Momentum → Exit
+        
         Returns:
             Anzahl geschlossener Positionen
         """
+        if not getattr(self.cfg, "use_momentum_exit", False):
+            return 0
+            
+        momentum_exit_bars = getattr(self.cfg, "momentum_exit_bars", 3)
+        momentum_period = getattr(self.cfg, "momentum_period", 14)
+        use_higher_tf = getattr(self.cfg, "momentum_exit_higher_tf", True)
+        
         positions = self.adapter.get_positions()
         if not positions:
             return 0
+            
         closed_count = 0
+        
         for pos in positions:
             symbol = pos.get("symbol")
             ticket = pos.get("ticket")
             pos_type = pos.get("type")  # 0 = BUY, 1 = SELL
             volume = float(pos.get("volume", 0.0) or 0.0)
+            
             if not symbol or ticket is None or pos_type is None or volume <= 0:
                 continue
-            # Berechne Momentum
-            momentum = self._calculate_position_momentum(symbol, momentum_lookback)
-            if momentum is None:
-                continue
-            # Prüfe ob Momentum gegen unsere Position läuft
+            
             is_long = pos_type == 0
-            adverse_momentum = False
-            if is_long and momentum < momentum_threshold:
-                # Long-Position aber Preis fällt stark
-                adverse_momentum = True
-                logger.warning(
-                    f"[{symbol}] Momentum-Exit LONG: Momentum {momentum:.4f} < {momentum_threshold:.4f}"
-                )
-            elif not is_long and momentum > abs(momentum_threshold):
-                # Short-Position aber Preis steigt stark
-                adverse_momentum = True
-                logger.warning(
-                    f"[{symbol}] Momentum-Exit SHORT: Momentum {momentum:.4f} > {abs(momentum_threshold):.4f}"
-                )
-            if adverse_momentum:
-                result = self.adapter.close_position(ticket, symbol, volume, pos_type)
-                retcode = result.get("retcode")
-                if retcode == self.SUCCESS_RETCODE:
-                    logger.info(f"[{symbol}] Position {ticket} erfolgreich geschlossen (Momentum-Exit)")
-                    closed_count += 1
-                    # Entferne aus active_signal_keys damit Symbol wieder frei ist
-                    direction = Dir.UP if is_long else Dir.DOWN
-                    key = f"{symbol}:{direction.value}"
-                    self._active_signal_keys.discard(key)
+            
+            # Bestimme höhere TF basierend auf Entry-TF
+            # Entry auf M30 → Check auf H1, Entry auf H1 → Check auf Daily
+            if use_higher_tf:
+                higher_tf = "H1" if self.cfg.timeframe == "M30" else "D1"
+            else:
+                higher_tf = self.cfg.timeframe
+            
+            # Berechne aktuelles Momentum auf höherer TF
+            current_mom = self._calculate_higher_tf_momentum(symbol, higher_tf, momentum_period)
+            if current_mom is None:
+                continue
+            
+            # Hole letzte Momentum-Werte
+            last_mom = self._momentum_last_value.get(ticket)
+            decline_count = self._momentum_decline_count.get(ticket, 0)
+            
+            if last_mom is not None:
+                # Prüfe ob Momentum schwächer wird
+                momentum_weakening = False
+                if is_long:
+                    # Long: Momentum soll positiv/steigend bleiben
+                    if current_mom < last_mom:
+                        momentum_weakening = True
                 else:
-                    logger.error(f"[{symbol}] Momentum-Exit fehlgeschlagen: {result}")
+                    # Short: Momentum soll negativ/fallend bleiben  
+                    if current_mom > last_mom:
+                        momentum_weakening = True
+                
+                if momentum_weakening:
+                    decline_count += 1
+                    self._momentum_decline_count[ticket] = decline_count
+                    logger.debug(
+                        f"[{symbol}] Momentum schwächer: {last_mom:.4f} → {current_mom:.4f} "
+                        f"(decline_count={decline_count}/{momentum_exit_bars})"
+                    )
+                else:
+                    # Reset counter
+                    decline_count = 0
+                    self._momentum_decline_count[ticket] = 0
+                
+                # Exit wenn N konsekutive Bars mit schwächerem Momentum
+                if decline_count >= momentum_exit_bars:
+                    logger.warning(
+                        f"[{symbol}] Momentum-Exit: {decline_count} konsekutive Bars mit "
+                        f"schwächerem Momentum auf {higher_tf}"
+                    )
+                    result = self.adapter.close_position(ticket, symbol, volume, pos_type)
+                    retcode = result.get("retcode")
+                    if retcode == self.SUCCESS_RETCODE:
+                        logger.info(f"[{symbol}] Position {ticket} geschlossen (Momentum-Exit)")
+                        closed_count += 1
+                        # Cleanup State
+                        self._momentum_decline_count.pop(ticket, None)
+                        self._momentum_last_value.pop(ticket, None)
+                        # Entferne aus active_signal_keys
+                        direction = Dir.UP if is_long else Dir.DOWN
+                        key = f"{symbol}:{direction.value}"
+                        self._active_signal_keys.discard(key)
+                    else:
+                        logger.error(f"[{symbol}] Momentum-Exit fehlgeschlagen: {result}")
+            
+            # Update last momentum value
+            self._momentum_last_value[ticket] = current_mom
+        
+        # Cleanup: Entferne State für geschlossene Positionen
+        open_tickets = {pos.get("ticket") for pos in positions if pos.get("ticket")}
+        for ticket in list(self._momentum_decline_count.keys()):
+            if ticket not in open_tickets:
+                self._momentum_decline_count.pop(ticket, None)
+                self._momentum_last_value.pop(ticket, None)
+        
         return closed_count
 
-    def _calculate_position_momentum(self, symbol: str, lookback: int) -> Optional[float]:
-        """Berechnet das Momentum für ein Symbol basierend auf letzten Bars.
-
+    def _calculate_higher_tf_momentum(self, symbol: str, timeframe: str, period: int) -> Optional[float]:
+        """Berechnet Momentum auf höherer Timeframe.
+        
+        Momentum = (price_now - price_N_bars_ago) / price_N_bars_ago
+        
         Returns:
-            Momentum als prozentuale Änderung (positiv = steigend, negativ = fallend)
+            Momentum als prozentuale Änderung oder None
         """
-        rates = self.adapter.get_rates(symbol, self.cfg.timeframe, lookback + 1)
-        if not rates or len(rates) < 2:
+        rates = self.adapter.get_rates(symbol, timeframe, period + 1)
+        if not rates or len(rates) < period + 1:
             return None
+        
         closes = []
         for row in rates:
             close_val = row.get("close") if isinstance(row, dict) else None
@@ -1475,11 +1536,15 @@ class OrderManager:
                 closes.append(float(close_val))
             except (TypeError, ValueError):
                 continue
-        if len(closes) < 2:
+        
+        if len(closes) < period + 1:
             return None
+        
         # Momentum = (aktueller Close - Close vor N bars) / Close vor N bars
-        first_close = closes[0]
-        last_close = closes[-1]
-        if first_close <= 0:
+        price_past = closes[0]  # ältester
+        price_now = closes[-1]  # neuester
+        
+        if price_past <= 0:
             return None
-        return (last_close - first_close) / first_close
+        
+        return (price_now - price_past) / price_past

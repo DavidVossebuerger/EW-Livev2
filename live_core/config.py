@@ -130,10 +130,11 @@ class LiveConfig:
     vola_horizon_days: float = 2.0
     vola_lookback_bars: int = 400
     vola_min_samples: int = 80
-    # Momentum-Exit: Schließe Positionen bei adverser Momentum-Bewegung
+    # Momentum-Exit (Backtest-Parität): Höhere TF, konsekutive abnehmende Bars
     use_momentum_exit: bool = True
-    momentum_exit_lookback: int = 10
-    momentum_exit_threshold: float = 0.002
+    momentum_exit_bars: int = 3           # Konsekutive Bars mit schwächerem Momentum
+    momentum_period: int = 14             # Lookback für Momentum-Berechnung
+    momentum_exit_higher_tf: bool = True  # H1 für M30, Daily für H1
     exposure_basis: str = "margin"
     exposure_custom_factor: float = 1.0
     exposure_default_leverage: float = 30.0
