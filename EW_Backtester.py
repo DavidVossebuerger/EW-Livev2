@@ -334,6 +334,8 @@ def parse_args():
     # Volatility Forecast Sizing (GARCH+HAR based)
     p.add_argument("--vola-forecast", action="store_true", help="Vola-Prognose für Position Sizing aktivieren")
     p.add_argument("--vola-forecast-window", type=int, default=252, help="Trainings-Fenster für Vola-Modell (default: 252 Tage)")
+    # Minimum Profit Factor (wie im Live System)
+    p.add_argument("--min-pf", type=float, default=0.0, help="Min Profit Factor (TP/SL Distanz), z.B. 1.2 = nur Trades mit RR >= 1.2:1 (wie Live System)")
     # Local Data (statt yfinance)
     p.add_argument("--local-data", type=str, default=None, help="Pfad zu lokalen Daten (Basis-Name, z.B. 'daten/xauusd' lädt _daily.csv, _h1.csv, _m30.csv)")
     # Manuelle Schwellen / Offsets
@@ -1612,7 +1614,7 @@ class Backtester:
         self.equity: List[Dict] = []
         self.model = None
         self.threshold = 0.5
-        self.telemetry = dict(setups=0, filtered_daily=0, filtered_ema=0, filtered_vol=0, filtered_volatility=0, filtered_regime=0, filtered_momentum=0, no_touch=0, no_confirm=0, accepted=0, vola_sized=0)
+        self.telemetry = dict(setups=0, filtered_daily=0, filtered_ema=0, filtered_vol=0, filtered_volatility=0, filtered_regime=0, filtered_momentum=0, filtered_pf=0, no_touch=0, no_confirm=0, accepted=0, vola_sized=0)
         
         # Volatility Forecast sizing (walk-forward)
         self.vola_forecaster = None
@@ -1776,6 +1778,16 @@ class Backtester:
                 rps = min_rps
             
             if rps<=1e-9: continue
+            
+            # Minimum Profit Factor Filter (wie Live System)
+            min_pf = CFG.get("MIN_PF", 0.0)
+            if min_pf > 0:
+                tp_distance = abs(sp.tp1 - entry)
+                stop_distance = rps
+                expected_pf = tp_distance / stop_distance if stop_distance > 0 else 0.0
+                if expected_pf < min_pf:
+                    self.telemetry["filtered_pf"] = self.telemetry.get("filtered_pf", 0) + 1
+                    continue
 
             max_hold=CFG["MAX_HOLD_M30"] if sp.entry_tf=="30m" else CFG["MAX_HOLD_H1"]
             
@@ -2216,7 +2228,7 @@ class Backtester:
         metrics=self.metrics()
         print("\n--- Telemetrie ---")
         print(f"Setups gesamt: {self.telemetry['setups']} | akzeptiert bis Entry: {self.telemetry['accepted']}")
-        print(f"Filter: daily={self.telemetry.get('filtered_daily',0)}, regime(ADX)={self.telemetry.get('filtered_regime',0)}, vola_regime={self.telemetry.get('filtered_vola_regime',0)}, ema={self.telemetry['filtered_ema']}, vol={self.telemetry['filtered_vol']}, momentum={self.telemetry.get('filtered_momentum',0)}, no_touch={self.telemetry['no_touch']}, no_confirm={self.telemetry['no_confirm']}")
+        print(f"Filter: daily={self.telemetry.get('filtered_daily',0)}, regime(ADX)={self.telemetry.get('filtered_regime',0)}, vola_regime={self.telemetry.get('filtered_vola_regime',0)}, ema={self.telemetry['filtered_ema']}, vol={self.telemetry['filtered_vol']}, momentum={self.telemetry.get('filtered_momentum',0)}, pf={self.telemetry.get('filtered_pf',0)}, no_touch={self.telemetry['no_touch']}, no_confirm={self.telemetry['no_confirm']}")
         if self.telemetry.get('vola_sized', 0) > 0:
             print(f"[VOLA-SIZING] {self.telemetry['vola_sized']} Trades mit Vola-Forecast angepasst")
         if CFG["USE_ML"]:
@@ -3070,6 +3082,12 @@ def main():
         if mom_exit_bars > 0:
             base['MOMENTUM_PERIOD'] = getattr(args, 'momentum_period', 14)
             print(f"[MOMENTUM-EXIT] Aktiv: Exit nach {mom_exit_bars} abnehmenden Bars (Periode={base['MOMENTUM_PERIOD']})")
+        
+        # --- MINIMUM PROFIT FACTOR (wie Live System) ---
+        min_pf = getattr(args, 'min_pf', 0.0)
+        base['MIN_PF'] = min_pf
+        if min_pf > 0:
+            print(f"[MIN-PF] Filter aktiv: Nur Trades mit TP/SL >= {min_pf:.2f} (wie Live System)")
         
         CFG=base
         if not getattr(args, 'neutral', False):
