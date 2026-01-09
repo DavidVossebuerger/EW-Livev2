@@ -334,8 +334,8 @@ def parse_args():
     # Volatility Forecast Sizing (GARCH+HAR based)
     p.add_argument("--vola-forecast", action="store_true", help="Vola-Prognose für Position Sizing aktivieren")
     p.add_argument("--vola-forecast-window", type=int, default=252, help="Trainings-Fenster für Vola-Modell (default: 252 Tage)")
-    # Minimum Profit Factor (wie im Live System)
-    p.add_argument("--min-pf", type=float, default=0.0, help="Min Profit Factor (TP/SL Distanz), z.B. 1.2 = nur Trades mit RR >= 1.2:1 (wie Live System)")
+    # Minimum Profit Factor (wie im Live System) - nur aktiv wenn explizit gesetzt
+    p.add_argument("--min-pf", type=float, default=None, help="Min Profit Factor (TP/SL Distanz), z.B. 1.2 = nur Trades mit RR >= 1.2:1. Ohne Flag: kein PF-Filter")
     # Sanity / Execution realism helpers
     p.add_argument("--realistic-costs", action="store_true", help="Apply conservative fee/slippage defaults for sanity checks (e.g., fee=0.05%, slippage=0.10%)")
     p.add_argument("--enter-at-close", action="store_true", help="Enter at close of confirmation bar (legacy/backtest parity) - default: enter next open to avoid lookahead")
@@ -3170,10 +3170,12 @@ def main():
             print(f"[MOMENTUM-EXIT] Aktiv: Exit nach {mom_exit_bars} abnehmenden Bars (Periode={base['MOMENTUM_PERIOD']})")
         
         # --- MINIMUM PROFIT FACTOR (wie Live System) ---
-        min_pf = getattr(args, 'min_pf', 0.0)
-        base['MIN_PF'] = min_pf
-        if min_pf > 0:
+        min_pf = getattr(args, 'min_pf', None)
+        base['MIN_PF'] = min_pf if min_pf is not None else 0.0
+        if min_pf is not None and min_pf > 0:
             print(f"[MIN-PF] Filter aktiv: Nur Trades mit TP/SL >= {min_pf:.2f} (wie Live System)")
+        else:
+            print("[MIN-PF] Filter deaktiviert (kein --min-pf Flag)")
         
         CFG=base
         if not getattr(args, 'neutral', False):
